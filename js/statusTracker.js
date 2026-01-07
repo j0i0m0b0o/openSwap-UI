@@ -585,13 +585,6 @@ class StatusTracker {
                 // Set reportId directly from event (no longer need to search tx receipt)
                 this.reportId = reportId;
 
-                // Check for missed InitialReport after a delay (only if not received by then)
-                setTimeout(() => {
-                    if (!this.initialReportReceived) {
-                        this.checkForMissedInitialReport(reportId);
-                    }
-                }, 3000);
-
                 // Show Oracle ID in header
                 if (this.elements.oracleId) {
                     this.elements.oracleId.textContent = `Oracle ID: ${reportId}`;
@@ -677,6 +670,7 @@ class StatusTracker {
                 // Mark ALL previous steps as completed
                 this.updateStep('matched', STEP_STATE.COMPLETED);
                 this.updateStep('initialReport', STEP_STATE.COMPLETED);
+
                 // If swap executed, initial report must have happened - ensure bailout is stopped
                 this.initialReportReceived = true;
                 this.stopLatencyCountdown();
@@ -1340,37 +1334,6 @@ class StatusTracker {
         const data = await response.json();
         if (data.error) throw new Error(data.error.message);
         return data.result;
-    }
-
-    /**
-     * Check for InitialReportSubmitted events that may have been missed due to race condition
-     * (event arrived before reportId was set)
-     */
-    async checkForMissedInitialReport(reportId) {
-        if (this.initialReportReceived) return; // Already got it
-
-        try {
-            // Query recent blocks for InitialReportSubmitted with this reportId
-            const currentBlockHex = await this.rpcCall('eth_blockNumber', []);
-            const currentBlock = parseInt(currentBlockHex, 16);
-            const fromBlock = Math.max(0, currentBlock - 100);
-
-            const reportIdHex = '0x' + reportId.toString(16).padStart(64, '0');
-            const logs = await this.rpcCall('eth_getLogs', [{
-                address: CONFIG.contracts.openOracle,
-                topics: [TOPICS.INITIAL_REPORT_SUBMITTED, reportIdHex],
-                fromBlock: '0x' + fromBlock.toString(16),
-                toBlock: 'latest'
-            }]);
-
-            if (logs && logs.length > 0) {
-                console.log(`[StatusTracker] Found missed InitialReportSubmitted for reportId=${reportId}`);
-                // Process the first matching event
-                await this.handleOracleEvent(logs[0]);
-            }
-        } catch (e) {
-            console.error('[StatusTracker] Error checking for missed InitialReport:', e);
-        }
     }
 
     /**

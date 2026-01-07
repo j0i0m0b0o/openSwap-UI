@@ -208,6 +208,16 @@ class OpenSwapContract {
             const totalNeeded = bountyParams.bountyToken === sellToken
                 ? BigInt(sellAmount) + bountyTotalWei
                 : BigInt(sellAmount);
+
+            // Check balance before approval/swap
+            const balance = await wallet.getBalance(sellToken);
+            if (balance < totalNeeded) {
+                const decimals = sellToken === CONFIG.tokens.USDC ? 6 : 18;
+                const needed = Number(totalNeeded) / (10 ** decimals);
+                const have = Number(balance) / (10 ** decimals);
+                throw new Error(`Insufficient balance. Need ${needed.toFixed(6)} but only have ${have.toFixed(6)} (includes bounty)`);
+            }
+
             const allowance = await wallet.getAllowance(sellToken, this.address);
             if (allowance < totalNeeded) {
                 // Approve 0.5% more to handle minor param changes
