@@ -492,16 +492,17 @@ class VolatilityTracker {
             const variance = squaredDiffs.reduce((a, b) => a + b, 0) / logReturns.length;
             const sigma15s = Math.sqrt(variance);
 
-            // Scale from 15s to 4s volatility: σ_4s = σ_15s / √(15/4)
-            const scaleFactor = Math.sqrt(15 / 4); // ≈ 1.936
-            const sigma4s = sigma15s / scaleFactor;
+            // Scale from 15s to settlement time: σ_t = σ_15s / √(15/t)
+            const settlementTime = this.currentSettlementTime || 4;
+            const scaleFactor = Math.sqrt(15 / settlementTime);
+            const sigmaSettlement = sigma15s / scaleFactor;
 
             // Apply 6.5x multiplier for slippage (same as IQR method)
-            const slippage = sigma4s * 6.5;
+            const slippage = sigmaSettlement * 6.5;
 
             this.lastKrakenVol = slippage;
 
-            console.log(`[Volatility] Kraken: σ_15s=${(sigma15s * 100).toFixed(4)}%, σ_4s=${(sigma4s * 100).toFixed(4)}%, 6.5σ=${(slippage * 100).toFixed(4)}% (${buckets.length} buckets, ${recentTrades.length} trades)`);
+            console.log(`[Volatility] Kraken: σ_15s=${(sigma15s * 100).toFixed(4)}%, σ_${settlementTime}s=${(sigmaSettlement * 100).toFixed(4)}%, 6.5σ=${(slippage * 100).toFixed(4)}% (${buckets.length} buckets, ${recentTrades.length} trades)`);
 
             return slippage;
         } catch (error) {

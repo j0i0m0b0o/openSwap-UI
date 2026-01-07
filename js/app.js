@@ -531,14 +531,15 @@ function setupEventListeners() {
                 // Calculate bounty ratio: bounty = ratio * sellAmt, so sellAmt = balance / (1 + ratio)
                 const balanceUsdc = parseFloat(rawBalance.toString()) / 1e6;
 
-                // Get 4-second volatility
-                let vol4s;
+                // Get settlement-time volatility
+                const settlementTime = parseInt(elements.settlementTimeInput.value) || CONFIG.defaults.settlementTime;
+                let volSettlement;
                 if (volatility.lastKrakenVol !== null) {
-                    vol4s = volatility.lastKrakenVol / 6.5;
+                    volSettlement = volatility.lastKrakenVol / 6.5;
                 } else if (volatility.lastCandleVol !== null) {
-                    vol4s = (volatility.lastCandleVol / 1.5) / Math.sqrt(15);
+                    volSettlement = (volatility.lastCandleVol / 1.5) / Math.sqrt(60 / settlementTime);
                 } else {
-                    vol4s = 0.001;
+                    volSettlement = 0.001;
                 }
 
                 // Calculate bounty ratio (bounty / sellAmt)
@@ -547,7 +548,7 @@ function setupEventListeners() {
                 // bountyStart = max(0.5 * vol * initLiq, 0.0065% of initLiq), capped at 0.2% of initLiq
                 const minBountyStartRatio = 0.000065 * initLiqRatio; // 0.0065% of initLiq
                 const maxBountyStartRatio = 0.002 * initLiqRatio; // 0.2% cap
-                const volBountyStartRatio = 0.5 * vol4s * initLiqRatio;
+                const volBountyStartRatio = 0.5 * volSettlement * initLiqRatio;
                 const bountyStartRatio = Math.min(Math.max(volBountyStartRatio, minBountyStartRatio), maxBountyStartRatio);
                 // totalBounty = max(0.15% of initLiq, 2 * bountyStart)
                 const minTotalRatio = 0.0015 * initLiqRatio; // 0.15% of initLiq
@@ -882,20 +883,21 @@ async function updateSwapDetails() {
                     document.getElementById('initialLiquidityLabel').textContent = 'Initial Liquidity (USDC)';
                 }
 
-                // Calculate bounty based on 4-second volatility
-                let vol4s;
+                // Calculate bounty based on settlement-time volatility
+                const settlementTime = parseInt(elements.settlementTimeInput.value) || CONFIG.defaults.settlementTime;
+                let volSettlement;
                 if (volatility.lastKrakenVol !== null) {
-                    vol4s = volatility.lastKrakenVol / 6.5; // already 4s, remove multiplier
+                    volSettlement = volatility.lastKrakenVol / 6.5; // already scaled to settlement time
                 } else if (volatility.lastCandleVol !== null) {
-                    vol4s = (volatility.lastCandleVol / 1.5) / Math.sqrt(15); // remove 1.5x, scale 1-min to 4-sec
+                    volSettlement = (volatility.lastCandleVol / 1.5) / Math.sqrt(60 / settlementTime); // remove 1.5x, scale 1-min to settlement time
                 } else {
-                    vol4s = 0.001; // fallback
+                    volSettlement = 0.001; // fallback
                 }
 
-                // bountyStartAmt = 0.5 * vol_4s * initLiq, min 0.0065%, capped at 0.2%
+                // bountyStartAmt = 0.5 * vol * initLiq, min 0.0065%, capped at 0.2%
                 const minBountyStartUsd = initLiqUsd * 0.000065; // 0.0065% floor
                 const maxBountyStartUsd = initLiqUsd * 0.002; // 0.2% cap
-                let bountyStartUsd = Math.max(0.5 * vol4s * initLiqUsd, minBountyStartUsd);
+                let bountyStartUsd = Math.max(0.5 * volSettlement * initLiqUsd, minBountyStartUsd);
                 bountyStartUsd = Math.min(bountyStartUsd, maxBountyStartUsd);
 
                 // totalAmtDeposited = max(0.15% of initLiq, 2 * bountyStartAmt)
@@ -929,7 +931,7 @@ async function updateSwapDetails() {
 
 /**
  * Recalculate bounty based on initial liquidity input
- * bountyStartAmt = 0.5 * vol_4s * initLiq, capped at 0.2%
+ * bountyStartAmt = 0.5 * vol * initLiq, capped at 0.2%
  * totalAmtDeposited = 2 * bountyStartAmt
  */
 function recalculateBounty() {
@@ -949,20 +951,21 @@ function recalculateBounty() {
             initLiqUsd = initLiqValue;
         }
 
-        // Get 4-second σ as decimal
-        let vol4s;
+        // Get settlement-time σ as decimal
+        const settlementTime = parseInt(elements.settlementTimeInput.value) || CONFIG.defaults.settlementTime;
+        let volSettlement;
         if (volatility.lastKrakenVol !== null) {
-            vol4s = volatility.lastKrakenVol / 6.5; // already 4s, remove multiplier
+            volSettlement = volatility.lastKrakenVol / 6.5; // already scaled to settlement time
         } else if (volatility.lastCandleVol !== null) {
-            vol4s = (volatility.lastCandleVol / 1.5) / Math.sqrt(15); // remove 1.5x, scale 1-min to 4-sec
+            volSettlement = (volatility.lastCandleVol / 1.5) / Math.sqrt(60 / settlementTime); // remove 1.5x, scale 1-min to settlement time
         } else {
-            vol4s = 0.001; // fallback
+            volSettlement = 0.001; // fallback
         }
 
-        // bountyStartAmt = 0.5 * vol_4s * initLiq, min 0.0065%, capped at 0.2%
+        // bountyStartAmt = 0.5 * vol * initLiq, min 0.0065%, capped at 0.2%
         const minBountyStartUsd = initLiqUsd * 0.000065; // 0.0065% floor
         const maxBountyStartUsd = initLiqUsd * 0.002; // 0.2% cap
-        let bountyStartUsd = Math.max(0.5 * vol4s * initLiqUsd, minBountyStartUsd);
+        let bountyStartUsd = Math.max(0.5 * volSettlement * initLiqUsd, minBountyStartUsd);
         bountyStartUsd = Math.min(bountyStartUsd, maxBountyStartUsd);
 
         // totalAmtDeposited = max(0.15% of initLiq, 2 * bountyStartAmt)
@@ -1254,15 +1257,15 @@ async function handleSwap() {
         // Escalation halt is 3x sell amount (in sellToken units)
         const escalationHalt = sellAmountWei * BigInt(3);
 
-        // Calculate bounty based on 4-second volatility
-        // Get 4-second σ as decimal
-        let vol4s;
+        // Calculate bounty based on settlement-time volatility
+        // Get settlement-time σ as decimal (settlementTime already declared above)
+        let volSettlement;
         if (volatility.lastKrakenVol !== null) {
-            vol4s = volatility.lastKrakenVol / 6.5; // already 4s, remove multiplier
+            volSettlement = volatility.lastKrakenVol / 6.5; // already scaled to settlement time
         } else if (volatility.lastCandleVol !== null) {
-            vol4s = (volatility.lastCandleVol / 1.5) / Math.sqrt(15); // remove 1.5x, scale 1-min to 4-sec
+            volSettlement = (volatility.lastCandleVol / 1.5) / Math.sqrt(60 / settlementTime); // remove 1.5x, scale 1-min to settlement time
         } else {
-            vol4s = 0.001; // fallback
+            volSettlement = 0.001; // fallback
         }
 
         let initLiqUsd;
@@ -1272,10 +1275,10 @@ async function handleSwap() {
             initLiqUsd = parseFloat(initialLiquidity.toString()) / 1e6;
         }
 
-        // bountyStartAmt = 0.5 * vol_4s * initLiq, min 0.0065%, capped at 0.2%
+        // bountyStartAmt = 0.5 * vol * initLiq, min 0.0065%, capped at 0.2%
         const minBountyStartUsd = initLiqUsd * 0.000065; // 0.0065% floor
         const maxBountyStartUsd = initLiqUsd * 0.002; // 0.2% cap
-        let bountyStartUsd = Math.max(0.5 * vol4s * initLiqUsd, minBountyStartUsd);
+        let bountyStartUsd = Math.max(0.5 * volSettlement * initLiqUsd, minBountyStartUsd);
         bountyStartUsd = Math.min(bountyStartUsd, maxBountyStartUsd);
 
         // totalAmtDeposited = max(0.15% of initLiq, 2 * bountyStartAmt)
@@ -1533,13 +1536,13 @@ async function updateCostBreakdown() {
             swapNotionalUsd = sellAmt; // USDC
         }
 
-        // 1. Fulfillment fee: max(minFee, min(maxFee, 25% of 4-second volatility from Kraken))
+        // 1. Fulfillment fee: max(minFee, min(maxFee, 25% of settlement-time volatility from Kraken))
         const minFeePct = CONFIG.defaults.startingFee / 100000; // e.g., 750 -> 0.0075%
         const maxFeePct = CONFIG.defaults.maxFee / 100000; // e.g., 2000 -> 0.02%
         let fulfillmentFeePct = maxFeePct;
         if (volatility.lastKrakenVol !== null) {
-            const vol4s = volatility.lastKrakenVol / 6.5; // Convert 6.5σ to raw 4s σ
-            const volBasedFeePct = 0.25 * vol4s * 100; // 25% of 4s vol as percentage
+            const volSettlement = volatility.lastKrakenVol / 6.5; // Convert 6.5σ to raw σ (already scaled to settlement time)
+            const volBasedFeePct = 0.25 * volSettlement * 100; // 25% of vol as percentage
             fulfillmentFeePct = Math.max(minFeePct, Math.min(maxFeePct, volBasedFeePct));
         }
 
@@ -1554,13 +1557,13 @@ async function updateCostBreakdown() {
             }
         }
 
-        // Volatility from tracker (use IQR if available, otherwise candle vol scaled to 4s)
-        // IQR is already 4-second based; candle vol is 1-minute, so divide by sqrt(15) to get 4s
+        // Volatility from tracker (use IQR if available, otherwise candle vol scaled to settlement time)
+        const settlementTime = parseInt(elements.settlementTimeInput.value) || CONFIG.defaults.settlementTime;
         let vol;
         if (volatility.lastIQR !== null) {
             vol = volatility.lastIQR;
         } else if (volatility.lastCandleVol !== null) {
-            vol = volatility.lastCandleVol / Math.sqrt(15); // 1-min to 4-sec
+            vol = volatility.lastCandleVol / Math.sqrt(60 / settlementTime); // 1-min to settlement time
         } else {
             return;
         }
