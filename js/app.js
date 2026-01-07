@@ -1,0 +1,1987 @@
+/**
+ * openSwap Application
+ * Main application entry point - ETH/USDC only with Coinbase price feed
+ */
+
+import { CONFIG, NETWORKS, setNetwork } from './config.js';
+import { wallet } from './wallet.js';
+import { openSwap } from './contract.js';
+import { ETH, USDC, getToken, formatTokenAmount, parseTokenAmount } from './tokens.js';
+import { priceFeed } from './price.js';
+import { volatility } from './volatility.js';
+import { gasOracle } from './gasOracle.js';
+import { statusTracker } from './statusTracker.js';
+import {
+    showToast,
+    openModal,
+    closeModal,
+    setButtonLoading,
+    formatNumber,
+    formatUSD,
+    formatTimeRemaining,
+    debounce,
+    shortenAddress,
+    validateNumericInput,
+    createAvatar
+} from './ui.js';
+
+// Application State
+const state = {
+    sellToken: ETH,
+    buyToken: USDC,
+    sellAmount: '',
+    buyAmount: '',
+    currentView: 'swap',
+    userOrders: [],
+    currentPrice: null,
+    isRecalculating: false, // True when recalculating slippage/bounty
+    pendingRecalcId: 0, // Increments on user-triggered recalc, used to ignore stale callbacks
+    activeRecalcId: 0, // The recalc ID that's currently being processed
+    ordersRefreshInterval: null, // Interval for refreshing orders view (contract data)
+    countdownInterval: null, // Interval for updating countdown displays every second
+    matchedSwapIds: new Map(), // Track optimistically matched swaps: swapId -> bailoutDeadline
+    settings: {
+        slippage: 0.2,
+        deadline: 60
+    }
+};
+
+// DOM Elements
+let elements = {};
+
+/**
+ * Initialize application
+ */
+async function init() {
+    cacheElements();
+    setupEventListeners();
+    setupWalletListeners();
+    setupPriceFeed();
+    setupVolatilityTracker();
+    initializeTokenDisplay();
+    updateSwapButton();
+
+    // Auto-connect if previously authorized
+    tryAutoConnect();
+
+    // Refresh balances every 5 seconds
+    setInterval(() => {
+        if (wallet.isConnected()) {
+            updateBalances();
+        }
+    }, 5000);
+
+    // Refresh balances when swap is executed (with retry for RPC staleness)
+    statusTracker.onExecuted(() => {
+        console.log('[App] Swap executed, refreshing balances...');
+        updateBalances();
+        // RPC may be stale, retry with increasing delays
+        setTimeout(() => updateBalances(), 2000);
+        setTimeout(() => updateBalances(), 5000);
+        setTimeout(() => updateBalances(), 10000);
+    });
+
+    // Refresh balances when swap is cancelled
+    statusTracker.onCancelled(() => {
+        console.log('[App] Swap cancelled, refreshing balances...');
+        updateBalances();
+        setTimeout(() => updateBalances(), 1000);
+    });
+
+    // Refresh orders when swap is matched
+    statusTracker.onMatched((swapId, bailoutDeadline) => {
+        console.log('[App] Swap matched, updating orders...', { swapId, bailoutDeadline });
+        // Track this as optimistically matched with bailout deadline
+        if (swapId) state.matchedSwapIds.set(swapId.toString(), bailoutDeadline);
+        // Re-render with optimistic update applied
+        renderOrdersList();
+    });
+
+    // Handle page visibility change - refresh data when user returns
+    setupVisibilityHandler();
+
+    console.log('openSwap UI initialized - ETH/USDC');
+}
+
+/**
+ * Setup visibility change handler to refresh stale data when user returns
+ */
+function setupVisibilityHandler() {
+    let lastHidden = 0;
+
+    document.addEventListener('visibilitychange', async () => {
+        if (document.visibilityState === 'hidden') {
+            lastHidden = Date.now();
+            return;
+        }
+
+        // Page became visible - check if we were hidden long enough to need refresh
+        const hiddenDuration = Date.now() - lastHidden;
+        if (hiddenDuration < 10000) return; // Less than 10s, data still fresh
+
+        console.log(`[App] Page visible after ${Math.round(hiddenDuration / 1000)}s, refreshing data...`);
+
+        // Disable swap button while refreshing
+        const btn = elements.swapBtn;
+        const wasDisabled = btn.disabled;
+        const prevText = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = 'Refreshing...';
+
+        try {
+            // Refresh all data in parallel
+            const refreshPromises = [
+                volatility.calculate(true), // Force volatility refresh
+            ];
+
+            // Refresh gas if wallet connected
+            if (wallet.isConnected() && wallet.provider) {
+                refreshPromises.push(gasOracle.update(wallet.provider, true));
+                refreshPromises.push(updateBalances());
+            }
+
+            await Promise.all(refreshPromises);
+
+            console.log('[App] Data refreshed after visibility change');
+        } catch (e) {
+            console.error('[App] Error refreshing data:', e);
+        }
+
+        // Re-enable swap button (updateSwapButton will set correct state)
+        updateSwapButton();
+    });
+}
+
+/**
+ * Try to auto-connect wallet if previously authorized
+ */
+async function tryAutoConnect() {
+    if (!wallet.isAvailable()) return;
+
+    try {
+        // Check if already authorized (doesn't prompt)
+        const accounts = await window.ethereum.request({ method: 'eth_accounts' });
+        if (accounts.length > 0) {
+            await wallet.connect();
+        }
+    } catch (e) {
+        // Silent fail - user can manually connect
+    }
+}
+
+/**
+ * Cache DOM elements
+ */
+function cacheElements() {
+    elements = {
+        // Header
+        connectBtn: document.getElementById('connectBtn'),
+        networkSwitcher: document.getElementById('networkSwitcher'),
+        networkBtn: document.getElementById('networkBtn'),
+        networkDropdown: document.getElementById('networkDropdown'),
+        networkIcon: document.getElementById('networkIcon'),
+        networkName: document.getElementById('networkName'),
+        navTabs: document.querySelectorAll('.nav-tab'),
+        mobileNavItems: document.querySelectorAll('.mobile-nav-item'),
+
+        // Views
+        swapView: document.getElementById('swapView'),
+        ordersView: document.getElementById('ordersView'),
+
+        // Swap inputs
+        sellAmount: document.getElementById('sellAmount'),
+        buyAmount: document.getElementById('buyAmount'),
+        sellTokenSelector: document.getElementById('sellTokenSelector'),
+        buyTokenSelector: document.getElementById('buyTokenSelector'),
+        sellTokenSymbol: document.getElementById('sellTokenSymbol'),
+        buyTokenSymbol: document.getElementById('buyTokenSymbol'),
+        sellTokenIcon: document.getElementById('sellTokenIcon'),
+        buyTokenIcon: document.getElementById('buyTokenIcon'),
+        sellBalance: document.getElementById('sellBalance'),
+        buyBalance: document.getElementById('buyBalance'),
+        sellUsdValue: document.getElementById('sellUsdValue'),
+        buyUsdValue: document.getElementById('buyUsdValue'),
+        swapDirectionBtn: document.getElementById('swapDirectionBtn'),
+        swapDetails: document.getElementById('swapDetails'),
+        swapBtn: document.getElementById('swapBtn'),
+
+        // Advanced settings
+        advancedToggle: document.getElementById('advancedToggle'),
+        advancedPanel: document.getElementById('advancedPanel'),
+        expirationInput: document.getElementById('expirationInput'),
+        settlerRewardInput: document.getElementById('settlerRewardInput'),
+        settlementTimeInput: document.getElementById('settlementTimeInput'),
+        initialLiquidityInput: document.getElementById('initialLiquidityInput'),
+        maxBountyInput: document.getElementById('maxBountyInput'),
+        maxBountyLabel: document.getElementById('maxBountyLabel'),
+        slippageInput: document.getElementById('slippageInput'),
+
+        // Gas debug
+        gasDebugBaseFee: document.getElementById('gasDebugBaseFee'),
+        gasDebugL1BaseFee: document.getElementById('gasDebugL1BaseFee'),
+        gasDebugEffective: document.getElementById('gasDebugEffective'),
+        gasDebugLowGas: document.getElementById('gasDebugLowGas'),
+        gasDebugSwapL2: document.getElementById('gasDebugSwapL2'),
+        gasDebugSwapL1: document.getElementById('gasDebugSwapL1'),
+        gasDebugSwapTotal: document.getElementById('gasDebugSwapTotal'),
+        gasDebugMatchL2: document.getElementById('gasDebugMatchL2'),
+        gasDebugMatchL1: document.getElementById('gasDebugMatchL1'),
+        gasDebugMatchTotal: document.getElementById('gasDebugMatchTotal'),
+        gasDebugSettleL2: document.getElementById('gasDebugSettleL2'),
+        gasDebugSettleL1: document.getElementById('gasDebugSettleL1'),
+        gasDebugSettleTotal: document.getElementById('gasDebugSettleTotal'),
+
+        // Cost breakdown
+        costBreakdownToggle: document.getElementById('costBreakdownToggle'),
+        costBreakdownPanel: document.getElementById('costBreakdownPanel'),
+        estTotalCost: document.getElementById('estTotalCost'),
+        costFulfillmentFee: document.getElementById('costFulfillmentFee'),
+        costReporterReward: document.getElementById('costReporterReward'),
+        costOtherGas: document.getElementById('costOtherGas'),
+
+        // Modals
+        tokenModal: document.getElementById('tokenModal'),
+        tokenClose: document.getElementById('tokenClose'),
+        tokenSearch: document.getElementById('tokenSearch'),
+        tokenList: document.getElementById('tokenList'),
+
+        // Orders view
+        ordersList: document.getElementById('ordersList'),
+        loadOrderInput: document.getElementById('loadOrderInput'),
+        loadOrderBtn: document.getElementById('loadOrderBtn'),
+
+        // Price display
+        swapRate: document.getElementById('swapRate'),
+        minReceived: document.getElementById('minReceived')
+    };
+}
+
+/**
+ * Initialize token display with ETH and USDC
+ */
+function initializeTokenDisplay() {
+    updateTokenDisplay('sell', state.sellToken);
+    updateTokenDisplay('buy', state.buyToken);
+    elements.sellTokenSelector.classList.remove('empty');
+    elements.buyTokenSelector.classList.remove('empty');
+}
+
+/**
+ * Setup price feed
+ */
+function setupPriceFeed() {
+    priceFeed.on(({ event, price, bid, ask }) => {
+        if (event === 'price') {
+            state.currentPrice = price;
+            updatePriceDisplay();
+            autoCalculateBuyAmount();
+        } else if (event === 'connected') {
+            showToast('Price Feed', 'Connected to Coinbase', 'success');
+        } else if (event === 'disconnected') {
+            showToast('Price Feed', 'Disconnected, reconnecting...', 'warning');
+        }
+    });
+
+    // Connect to price feed
+    priceFeed.connect();
+}
+
+/**
+ * Setup volatility tracker for auto-slippage
+ */
+function setupVolatilityTracker() {
+    volatility.on(({ iqr, candleVol, fallback }) => {
+        // Update slippage input with recommended value (only if we have valid volatility data)
+        if ((iqr !== null || candleVol !== null) && !fallback) {
+            const recommended = volatility.getRecommendedSlippage();
+            elements.slippageInput.value = recommended.toFixed(3);
+            state.settings.slippage = recommended;
+            console.log(`Auto-slippage updated: ${recommended.toFixed(3)}%`);
+        }
+
+        // Update cost breakdown (IQR affects reporter reward estimate)
+        updateCostBreakdown();
+
+        // Only clear recalculating state if this callback is from the latest user-triggered recalc
+        // (or if there's no pending user recalc, i.e., this is a periodic update)
+        if (state.pendingRecalcId === 0 || state.activeRecalcId === state.pendingRecalcId) {
+            state.isRecalculating = false;
+            state.pendingRecalcId = 0;
+            state.activeRecalcId = 0;
+            updateSwapButton();
+        }
+    });
+
+    // Initialize with current settlement time from input
+    const initialSettlementTime = parseInt(elements.settlementTimeInput.value) || CONFIG.defaults.settlementTime;
+    volatility.setSettlementTime(initialSettlementTime);
+
+    // Start tracking
+    volatility.start();
+}
+
+/**
+ * Update price display in UI
+ */
+function updatePriceDisplay() {
+    if (!state.currentPrice) return;
+
+    const priceFormatted = formatNumber(state.currentPrice, 2);
+
+    // Always show ETH price in USD
+    if (elements.swapRate) {
+        elements.swapRate.textContent = `1 ETH = $${priceFormatted}`;
+    }
+
+    // Update USD values
+    updateUsdValues();
+}
+
+/**
+ * Update USD value displays
+ */
+function updateUsdValues() {
+    if (!state.currentPrice) return;
+
+    const sellAmt = parseFloat(state.sellAmount) || 0;
+    const buyAmt = parseFloat(state.buyAmount) || 0;
+
+    if (state.sellToken.symbol === 'ETH') {
+        elements.sellUsdValue.textContent = formatUSD(sellAmt * state.currentPrice);
+        elements.buyUsdValue.textContent = formatUSD(buyAmt);
+    } else {
+        elements.sellUsdValue.textContent = formatUSD(sellAmt);
+        elements.buyUsdValue.textContent = formatUSD(buyAmt * state.currentPrice);
+    }
+}
+
+/**
+ * Auto-calculate buy amount based on current price
+ */
+function autoCalculateBuyAmount() {
+    if (!state.currentPrice || !state.sellAmount) return;
+
+    const sellAmt = parseFloat(state.sellAmount);
+    if (isNaN(sellAmt) || sellAmt <= 0) return;
+
+    let buyAmt;
+    if (state.sellToken.symbol === 'ETH') {
+        // Selling ETH for USDC
+        buyAmt = sellAmt * state.currentPrice;
+    } else {
+        // Selling USDC for ETH
+        buyAmt = sellAmt / state.currentPrice;
+    }
+
+    state.buyAmount = buyAmt.toFixed(state.buyToken.symbol === 'USDC' ? 2 : 6);
+    elements.buyAmount.value = state.buyAmount;
+
+    updateSwapDetails();
+    updateUsdValues();
+    updateSwapButton();
+}
+
+/**
+ * Setup event listeners
+ */
+function setupEventListeners() {
+    // Wallet connection
+    elements.connectBtn.addEventListener('click', handleConnect);
+
+    // Network switcher dropdown
+    elements.networkBtn.addEventListener('click', () => {
+        elements.networkSwitcher.classList.toggle('open');
+    });
+
+    // Close dropdown when clicking outside
+    document.addEventListener('click', (e) => {
+        if (!elements.networkSwitcher.contains(e.target)) {
+            elements.networkSwitcher.classList.remove('open');
+        }
+    });
+
+    // Network option selection
+    elements.networkDropdown.querySelectorAll('.network-option').forEach(option => {
+        option.addEventListener('click', () => handleNetworkChange(option.dataset.network));
+    });
+
+    // Navigation
+    elements.navTabs.forEach(tab => {
+        tab.addEventListener('click', () => switchView(tab.dataset.view));
+    });
+    elements.mobileNavItems.forEach(item => {
+        item.addEventListener('click', () => switchView(item.dataset.view));
+    });
+
+    // Swap direction
+    elements.swapDirectionBtn.addEventListener('click', swapTokens);
+
+    // Amount inputs
+    elements.sellAmount.addEventListener('input', handleSellAmountChange);
+    elements.buyAmount.addEventListener('input', handleBuyAmountChange);
+
+    // Swap button
+    elements.swapBtn.addEventListener('click', handleSwap);
+
+    // Advanced toggle
+    elements.advancedToggle.addEventListener('click', toggleAdvanced);
+
+    // Cost breakdown toggle
+    elements.costBreakdownToggle.addEventListener('click', toggleCostBreakdown);
+
+    // Token modal close (we won't use the modal for selection anymore)
+    elements.tokenClose.addEventListener('click', () => closeModal('tokenModal'));
+
+    // Slippage manual input (capped at 0.5%)
+    elements.slippageInput.addEventListener('change', () => {
+        let val = parseFloat(elements.slippageInput.value);
+        if (!isNaN(val) && val > 0) {
+            val = Math.min(0.5, val); // cap at 0.5%
+            elements.slippageInput.value = val;
+            state.settings.slippage = val;
+            updateSwapDetails();
+        }
+    });
+
+    // Settlement time change - recalculate volatility/slippage
+    // Use input event to catch changes immediately, debounce the actual recalc
+    let settlementTimeDebounce = null;
+    elements.settlementTimeInput.addEventListener('input', () => {
+        const val = parseInt(elements.settlementTimeInput.value);
+        if (!isNaN(val) && val > 0) {
+            // Immediately disable button and increment pending recalc ID
+            state.isRecalculating = true;
+            state.pendingRecalcId++;
+            const thisRecalcId = state.pendingRecalcId;
+            updateSwapButton();
+
+            // Debounce the actual recalculation (wait 500ms after last keystroke)
+            clearTimeout(settlementTimeDebounce);
+            settlementTimeDebounce = setTimeout(() => {
+                // Mark this recalc as the active one
+                state.activeRecalcId = thisRecalcId;
+                volatility.setSettlementTime(val);
+            }, 500);
+        }
+    });
+
+    // Initial liquidity change - recalculate bounty and cost breakdown
+    elements.initialLiquidityInput.addEventListener('input', () => {
+        recalculateBounty();
+        updateCostBreakdown();
+    });
+
+    // Close modals on overlay click
+    document.querySelectorAll('.modal-overlay').forEach(overlay => {
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) {
+                closeModal(overlay.id);
+            }
+        });
+    });
+
+    // Validate numeric inputs
+    [elements.sellAmount, elements.buyAmount].forEach(input => {
+        input.addEventListener('input', () => validateNumericInput(input));
+    });
+
+    // Max button for sell balance
+    elements.sellBalance.parentElement.addEventListener('click', async () => {
+        if (!wallet.isConnected()) return;
+
+        try {
+            // Get raw balance from chain (avoids rounding issues from displayed text)
+            const rawBalance = await wallet.getTokenBalance(state.sellToken.address);
+            if (!rawBalance || rawBalance === BigInt(0)) return;
+
+            const decimals = state.sellToken.decimals;
+            let maxAmount;
+
+            // If selling ETH, reserve some for gasComp, bounty, settlerReward, and gas buffer
+            if (state.sellToken.address === ethers.ZeroAddress && state.currentPrice > 0) {
+                const balanceEth = parseFloat(ethers.formatEther(rawBalance));
+
+                // Calculate overhead costs in ETH (gas oracle uses its own effective gas price)
+                const gasCompEth = gasOracle.isReady()
+                    ? parseFloat(ethers.formatEther(gasOracle.getMatchCost()))
+                    : 0.001; // fallback
+                const settlerRewardEth = gasOracle.isReady()
+                    ? parseFloat(ethers.formatEther(gasOracle.getSettleCost()))
+                    : 0.001; // fallback
+
+                // Estimate bounty: ~0.1% of initialLiquidity (~10% of sellAmt) = ~0.01% of sellAmt
+                const estimatedBountyEth = balanceEth * 0.0001; // 0.01%
+
+                // Gas buffer: 25 cents worth of ETH
+                const gasBufferEth = 0.25 / state.currentPrice;
+
+                // Total overhead
+                const overheadEth = gasCompEth + settlerRewardEth + estimatedBountyEth + gasBufferEth + 0.000001;
+
+                // Max sellable amount
+                const maxSellable = balanceEth - overheadEth;
+                if (maxSellable > 0) {
+                    maxAmount = maxSellable.toFixed(6);
+                } else {
+                    showToast('Insufficient Balance', 'Not enough ETH to cover swap overhead costs', 'error');
+                    return;
+                }
+            } else {
+                // For USDC, reserve exact amount for bounty (bounty is paid in USDC when selling USDC)
+                // Calculate bounty ratio: bounty = ratio * sellAmt, so sellAmt = balance / (1 + ratio)
+                const balanceUsdc = parseFloat(rawBalance.toString()) / 1e6;
+
+                // Get 4-second volatility
+                let vol4s;
+                if (volatility.lastKrakenVol !== null) {
+                    vol4s = volatility.lastKrakenVol / 6.5;
+                } else if (volatility.lastCandleVol !== null) {
+                    vol4s = (volatility.lastCandleVol / 1.5) / Math.sqrt(15);
+                } else {
+                    vol4s = 0.001;
+                }
+
+                // Calculate bounty ratio (bounty / sellAmt)
+                // initLiq = 10% of sellAmt, so initLiqRatio = 0.1
+                const initLiqRatio = 0.1;
+                // bountyStart = max(0.5 * vol * initLiq, 0.0065% of initLiq), capped at 0.2% of initLiq
+                const minBountyStartRatio = 0.000065 * initLiqRatio; // 0.0065% of initLiq
+                const maxBountyStartRatio = 0.002 * initLiqRatio; // 0.2% cap
+                const volBountyStartRatio = 0.5 * vol4s * initLiqRatio;
+                const bountyStartRatio = Math.min(Math.max(volBountyStartRatio, minBountyStartRatio), maxBountyStartRatio);
+                // totalBounty = max(0.15% of initLiq, 2 * bountyStart)
+                const minTotalRatio = 0.0015 * initLiqRatio; // 0.15% of initLiq
+                const bountyRatio = Math.max(minTotalRatio, 2 * bountyStartRatio);
+
+                // sellAmt = balance / (1 + bountyRatio + buffer)
+                // Add 0.01% buffer for volatility changes between max click and swap
+                const buffer = 0.0001;
+                const maxSellable = balanceUsdc / (1 + bountyRatio + buffer);
+
+                if (maxSellable > 0) {
+                    maxAmount = maxSellable.toFixed(6);
+                } else {
+                    showToast('Insufficient Balance', 'Not enough USDC to cover bounty', 'error');
+                    return;
+                }
+            }
+
+            elements.sellAmount.value = maxAmount;
+            state.sellAmount = elements.sellAmount.value;
+            autoCalculateBuyAmount();
+            updateSwapButton();
+
+            // Scroll to Create Swap button
+            document.getElementById('swapBtn').scrollIntoView({ behavior: 'smooth', block: 'center' });
+        } catch (e) {
+            console.error('Error setting max balance:', e);
+        }
+    });
+
+    // Load order by ID
+    elements.loadOrderBtn.addEventListener('click', handleLoadOrder);
+    elements.loadOrderInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') handleLoadOrder();
+    });
+}
+
+/**
+ * Setup wallet event listeners
+ */
+function setupWalletListeners() {
+    wallet.on(async ({ event, address, chainId }) => {
+        switch (event) {
+            case 'connect':
+                updateConnectButton(address);
+                await updateBalances();
+                // Update gas oracle L1 fees
+                gasOracle.update(wallet.provider);
+                if (state.currentView === 'orders') {
+                    loadUserOrders();
+                }
+                showToast('Connected', `Wallet connected: ${shortenAddress(address)}`, 'success');
+                break;
+
+            case 'disconnect':
+                updateConnectButton(null);
+                showToast('Disconnected', 'Wallet disconnected', 'info');
+                break;
+
+            case 'accountsChanged':
+                updateConnectButton(address);
+                await updateBalances();
+                showToast('Account Changed', `Now using: ${shortenAddress(address)}`, 'info');
+                break;
+
+            case 'chainChanged':
+                if (chainId !== CONFIG.chainId) {
+                    showToast('Wrong Network', `Please switch to ${CONFIG.chainName}`, 'warning');
+                }
+                break;
+        }
+        updateSwapButton();
+    });
+}
+
+/**
+ * Handle network change
+ */
+async function handleNetworkChange(networkKey) {
+    setNetwork(networkKey);
+
+    // Update UI
+    const networkConfig = NETWORKS[networkKey];
+    elements.networkName.textContent = networkConfig.chainName;
+    elements.networkIcon.src = networkKey === 'optimism'
+        ? 'https://assets.coingecko.com/coins/images/25244/small/Optimism.png'
+        : 'https://avatars.githubusercontent.com/u/108554348?s=200&v=4';
+    elements.networkIcon.alt = networkConfig.chainName;
+
+    // Update active state in dropdown
+    elements.networkDropdown.querySelectorAll('.network-option').forEach(opt => {
+        opt.classList.toggle('active', opt.dataset.network === networkKey);
+    });
+
+    // Close dropdown
+    elements.networkSwitcher.classList.remove('open');
+
+    // Update contract address
+    openSwap.address = CONFIG.contracts.openSwap;
+
+    // If wallet connected, prompt to switch chain
+    if (wallet.isConnected()) {
+        try {
+            await wallet.switchNetwork(CONFIG.chainId);
+            await updateBalances();
+        } catch (error) {
+            showToast('Network Error', 'Failed to switch network', 'error');
+        }
+    }
+
+    showToast('Network Changed', `Switched to ${CONFIG.chainName}`, 'success');
+}
+
+/**
+ * Handle wallet connection
+ */
+async function handleConnect() {
+    if (wallet.isConnected()) {
+        wallet.disconnect();
+        return;
+    }
+
+    try {
+        setButtonLoading(elements.connectBtn, true);
+        await wallet.connect();
+    } catch (error) {
+        console.error('Connection error:', error);
+        showToast('Connection Failed', error.message, 'error');
+    } finally {
+        setButtonLoading(elements.connectBtn, false, wallet.isConnected() ? shortenAddress(wallet.address) : 'Connect Wallet');
+    }
+}
+
+/**
+ * Update connect button state
+ */
+function updateConnectButton(address) {
+    if (address) {
+        elements.connectBtn.innerHTML = `
+            <div class="wallet-avatar">${createAvatar(address)}</div>
+            ${shortenAddress(address)}
+        `;
+        elements.connectBtn.classList.add('connected');
+    } else {
+        elements.connectBtn.innerHTML = 'Connect Wallet';
+        elements.connectBtn.classList.remove('connected');
+    }
+}
+
+/**
+ * Switch view
+ */
+function switchView(view) {
+    state.currentView = view;
+
+    // Update nav tabs
+    elements.navTabs.forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.view === view);
+    });
+    elements.mobileNavItems.forEach(item => {
+        item.classList.toggle('active', item.dataset.view === view);
+    });
+
+    // Update view panels
+    document.querySelectorAll('.view-panel').forEach(panel => {
+        panel.classList.remove('active');
+    });
+
+    const viewElement = document.getElementById(`${view}View`);
+    if (viewElement) {
+        viewElement.classList.add('active');
+    }
+
+    // Load view-specific data and manage refresh intervals
+    if (view === 'orders') {
+        loadUserOrders();
+        // Retry quickly in case RPC is stale
+        setTimeout(() => loadUserOrders(), 2000);
+        setTimeout(() => loadUserOrders(), 5000);
+        // Start periodic refresh for contract data (every 10 seconds)
+        if (state.ordersRefreshInterval) {
+            clearInterval(state.ordersRefreshInterval);
+        }
+        state.ordersRefreshInterval = setInterval(() => {
+            if (wallet.isConnected() && state.currentView === 'orders') {
+                loadUserOrders();
+            }
+        }, 10000);
+        // Start countdown update every second
+        if (state.countdownInterval) {
+            clearInterval(state.countdownInterval);
+        }
+        state.countdownInterval = setInterval(updateCountdowns, 1000);
+    } else {
+        // Clear intervals when leaving orders view
+        if (state.ordersRefreshInterval) {
+            clearInterval(state.ordersRefreshInterval);
+            state.ordersRefreshInterval = null;
+        }
+        if (state.countdownInterval) {
+            clearInterval(state.countdownInterval);
+            state.countdownInterval = null;
+        }
+    }
+}
+
+/**
+ * Update token display
+ */
+function updateTokenDisplay(side, token) {
+    const symbolEl = side === 'sell' ? elements.sellTokenSymbol : elements.buyTokenSymbol;
+    const iconEl = side === 'sell' ? elements.sellTokenIcon : elements.buyTokenIcon;
+
+    symbolEl.textContent = token.symbol;
+
+    if (token.logo) {
+        iconEl.innerHTML = `<img src="${token.logo}" alt="${token.symbol}" onerror="this.style.display='none';this.parentElement.querySelector('span').style.display='block'"><span style="display:none">${token.symbol.slice(0, 2)}</span>`;
+    } else {
+        iconEl.innerHTML = `<span>${token.symbol.slice(0, 2)}</span>`;
+    }
+}
+
+/**
+ * Swap sell and buy tokens
+ */
+function swapTokens() {
+    const tempToken = state.sellToken;
+    state.sellToken = state.buyToken;
+    state.buyToken = tempToken;
+
+    // Swap amounts
+    const tempAmount = state.sellAmount;
+    state.sellAmount = state.buyAmount;
+    state.buyAmount = tempAmount;
+
+    // Swap displayed balances immediately (before async fetch)
+    const tempBalance = elements.sellBalance.textContent;
+    elements.sellBalance.textContent = elements.buyBalance.textContent;
+    elements.buyBalance.textContent = tempBalance;
+
+    updateTokenDisplay('sell', state.sellToken);
+    updateTokenDisplay('buy', state.buyToken);
+
+    elements.sellAmount.value = state.sellAmount;
+    elements.buyAmount.value = state.buyAmount;
+
+    updateBalances();
+    updatePriceDisplay();
+    updateUsdValues();
+    updateSwapButton();
+}
+
+/**
+ * Handle sell amount change
+ */
+function handleSellAmountChange() {
+    state.sellAmount = elements.sellAmount.value;
+    if (!state.sellAmount || parseFloat(state.sellAmount) === 0) {
+        state.buyAmount = '';
+        elements.buyAmount.value = '';
+        elements.swapDetails.classList.remove('visible');
+    } else {
+        autoCalculateBuyAmount();
+    }
+    updateSwapButton();
+}
+
+/**
+ * Handle buy amount change (manual override)
+ */
+function handleBuyAmountChange() {
+    state.buyAmount = elements.buyAmount.value;
+    updateSwapDetails();
+    updateUsdValues();
+    updateSwapButton();
+}
+
+/**
+ * Update swap details
+ */
+async function updateSwapDetails() {
+    const hasAmounts = state.sellAmount && state.buyAmount && parseFloat(state.sellAmount) > 0 && parseFloat(state.buyAmount) > 0;
+
+    if (hasAmounts && state.currentPrice) {
+        elements.swapDetails.classList.add('visible');
+
+        // Calculate min received based on slippage
+        const slippage = state.settings.slippage / 100;
+        const minReceived = parseFloat(state.buyAmount) * (1 - slippage);
+        document.getElementById('minReceived').textContent = `${formatNumber(minReceived, state.buyToken.symbol === 'USDC' ? 2 : 6)} ${state.buyToken.symbol}`;
+        const startingFeePct = (CONFIG.defaults.startingFee / 100000).toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
+        const maxFeePct = (CONFIG.defaults.maxFee / 100000).toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
+        document.getElementById('fulfillmentFee').textContent = `${startingFeePct}% / ${maxFeePct}%`;
+
+        // Calculate and display initial liquidity, settler reward, and bounty
+        try {
+            const provider = wallet.provider;
+            if (provider) {
+                // Update gas oracle if needed (it caches internally)
+                await gasOracle.update(provider);
+                if (!gasOracle.isReady()) return;
+
+                // Get gas costs from oracle (uses effective gas price with 15% tip)
+                // For init liq floor, use the version with low gas regime floor (0.001 gwei clamp)
+                const gasCostWei = gasOracle.getDisputeCostForInitLiq();
+
+                // Calculate settler reward (includes 25% spread and low gas minimum)
+                const settlerRewardWei = gasOracle.getSettleCost();
+                const settlerRewardEth = Number(settlerRewardWei) / 1e18;
+                elements.settlerRewardInput.placeholder = settlerRewardEth.toFixed(9);
+
+                // Calculate initial liquidity: max(10% of sellAmt, gasCost / 0.01%)
+                // 0.01% constraint means: gasCost <= 0.0001 * initLiq, so minInitLiq = gasCost / 0.0001 = gasCost * 10000
+                const sellAmt = parseFloat(state.sellAmount);
+                let initLiqValue, initLiqUsd;
+
+                if (state.sellToken.symbol === 'ETH') {
+                    const minInitLiqWei = gasCostWei * BigInt(10000);  // gasCost / 0.01%
+                    const tenPercentSellWei = BigInt(Math.floor(sellAmt * 1e18)) * BigInt(10) / BigInt(100);
+                    const initLiqWei = tenPercentSellWei > minInitLiqWei ? tenPercentSellWei : minInitLiqWei;
+                    initLiqValue = Number(initLiqWei) / 1e18;
+                    initLiqUsd = initLiqValue * state.currentPrice;
+                    elements.initialLiquidityInput.placeholder = initLiqValue.toFixed(6);
+                    document.getElementById('initialLiquidityLabel').textContent = 'Initial Liquidity (WETH)';
+                } else {
+                    const gasCostEth = Number(gasCostWei) / 1e18;
+                    const gasCostUsd = gasCostEth * state.currentPrice;
+                    const minInitLiqUsd = gasCostUsd * 10000;  // gasCost / 0.01%
+                    const tenPercentSellUsd = sellAmt * 0.10;
+                    initLiqUsd = tenPercentSellUsd > minInitLiqUsd ? tenPercentSellUsd : minInitLiqUsd;
+                    elements.initialLiquidityInput.placeholder = initLiqUsd.toFixed(2);
+                    document.getElementById('initialLiquidityLabel').textContent = 'Initial Liquidity (USDC)';
+                }
+
+                // Calculate bounty based on 4-second volatility
+                let vol4s;
+                if (volatility.lastKrakenVol !== null) {
+                    vol4s = volatility.lastKrakenVol / 6.5; // already 4s, remove multiplier
+                } else if (volatility.lastCandleVol !== null) {
+                    vol4s = (volatility.lastCandleVol / 1.5) / Math.sqrt(15); // remove 1.5x, scale 1-min to 4-sec
+                } else {
+                    vol4s = 0.001; // fallback
+                }
+
+                // bountyStartAmt = 0.5 * vol_4s * initLiq, min 0.0065%, capped at 0.2%
+                const minBountyStartUsd = initLiqUsd * 0.000065; // 0.0065% floor
+                const maxBountyStartUsd = initLiqUsd * 0.002; // 0.2% cap
+                let bountyStartUsd = Math.max(0.5 * vol4s * initLiqUsd, minBountyStartUsd);
+                bountyStartUsd = Math.min(bountyStartUsd, maxBountyStartUsd);
+
+                // totalAmtDeposited = max(0.15% of initLiq, 2 * bountyStartAmt)
+                const minTotalUsd = initLiqUsd * 0.0015; // 0.15% floor
+                const twiceBountyStart = bountyStartUsd * 2;
+                const totalBountyUsd = Math.max(minTotalUsd, twiceBountyStart);
+
+                // Display in USDC when selling USDC, ETH when selling ETH
+                if (state.sellToken.address !== ethers.ZeroAddress) {
+                    document.getElementById('oracleBounty').textContent = `${totalBountyUsd.toFixed(6)} USDC`;
+                    elements.maxBountyInput.value = totalBountyUsd.toFixed(6);
+                    elements.maxBountyLabel.textContent = 'Max Bounty (USDC)';
+                } else {
+                    const totalBountyEth = totalBountyUsd / state.currentPrice;
+                    document.getElementById('oracleBounty').textContent = `${totalBountyEth.toFixed(9)} ETH`;
+                    elements.maxBountyInput.value = totalBountyEth.toFixed(9);
+                    elements.maxBountyLabel.textContent = 'Max Bounty (ETH)';
+                }
+            }
+        } catch (e) {
+            // Silently fail
+        }
+
+        // Update cost breakdown and gas debug
+        updateCostBreakdown();
+        updateGasDebug();
+    } else {
+        elements.swapDetails.classList.remove('visible');
+    }
+}
+
+/**
+ * Recalculate bounty based on initial liquidity input
+ * bountyStartAmt = 0.5 * vol_4s * initLiq, capped at 0.2%
+ * totalAmtDeposited = 2 * bountyStartAmt
+ */
+function recalculateBounty() {
+    const initLiqInput = elements.initialLiquidityInput.value;
+    if (!initLiqInput || initLiqInput === '' || !state.currentPrice) return;
+
+    try {
+        let initLiqUsd;
+        const initLiqValue = parseFloat(initLiqInput);
+        if (isNaN(initLiqValue) || initLiqValue <= 0) return;
+
+        if (state.sellToken.address === ethers.ZeroAddress) {
+            // Selling ETH - initial liquidity is in ETH
+            initLiqUsd = initLiqValue * state.currentPrice;
+        } else {
+            // Selling USDC - initial liquidity is in USDC
+            initLiqUsd = initLiqValue;
+        }
+
+        // Get 4-second σ as decimal
+        let vol4s;
+        if (volatility.lastKrakenVol !== null) {
+            vol4s = volatility.lastKrakenVol / 6.5; // already 4s, remove multiplier
+        } else if (volatility.lastCandleVol !== null) {
+            vol4s = (volatility.lastCandleVol / 1.5) / Math.sqrt(15); // remove 1.5x, scale 1-min to 4-sec
+        } else {
+            vol4s = 0.001; // fallback
+        }
+
+        // bountyStartAmt = 0.5 * vol_4s * initLiq, min 0.0065%, capped at 0.2%
+        const minBountyStartUsd = initLiqUsd * 0.000065; // 0.0065% floor
+        const maxBountyStartUsd = initLiqUsd * 0.002; // 0.2% cap
+        let bountyStartUsd = Math.max(0.5 * vol4s * initLiqUsd, minBountyStartUsd);
+        bountyStartUsd = Math.min(bountyStartUsd, maxBountyStartUsd);
+
+        // totalAmtDeposited = max(0.15% of initLiq, 2 * bountyStartAmt)
+        const minTotalUsd = initLiqUsd * 0.0015; // 0.15% floor
+        const twiceBountyStart = bountyStartUsd * 2;
+        const totalBountyUsd = Math.max(minTotalUsd, twiceBountyStart);
+
+        // Display in USDC when selling USDC, ETH when selling ETH
+        if (state.sellToken.address !== ethers.ZeroAddress) {
+            document.getElementById('oracleBounty').textContent = `${totalBountyUsd.toFixed(6)} USDC`;
+            elements.maxBountyInput.value = totalBountyUsd.toFixed(6);
+            elements.maxBountyLabel.textContent = 'Max Bounty (USDC)';
+        } else {
+            const totalBountyEth = totalBountyUsd / state.currentPrice;
+            document.getElementById('oracleBounty').textContent = `${totalBountyEth.toFixed(9)} ETH`;
+            elements.maxBountyInput.value = totalBountyEth.toFixed(9);
+            elements.maxBountyLabel.textContent = 'Max Bounty (ETH)';
+        }
+    } catch (e) {
+        // Silently fail
+    }
+}
+
+/**
+ * Update token balances
+ */
+async function updateBalances() {
+    if (!wallet.isConnected()) {
+        elements.sellBalance.textContent = '0.00';
+        elements.buyBalance.textContent = '0.00';
+        return;
+    }
+
+    // Fetch both balances in parallel
+    const [sellResult, buyResult] = await Promise.allSettled([
+        wallet.getTokenBalance(state.sellToken.address),
+        wallet.getTokenBalance(state.buyToken.address)
+    ]);
+
+    const sellBal = sellResult.status === 'fulfilled' ? sellResult.value.toString() : '0';
+    const buyBal = buyResult.status === 'fulfilled' ? buyResult.value.toString() : '0';
+
+    console.log(`[Balances] ${state.sellToken.symbol}: ${sellBal} (${formatTokenAmount(sellBal, state.sellToken.decimals)}), ${state.buyToken.symbol}: ${buyBal} (${formatTokenAmount(buyBal, state.buyToken.decimals)})`);
+
+    elements.sellBalance.textContent = sellResult.status === 'fulfilled'
+        ? formatTokenAmount(sellResult.value.toString(), state.sellToken.decimals)
+        : '0.00';
+
+    elements.buyBalance.textContent = buyResult.status === 'fulfilled'
+        ? formatTokenAmount(buyResult.value.toString(), state.buyToken.decimals)
+        : '0.00';
+}
+
+/**
+ * Update swap button state
+ */
+function updateSwapButton() {
+    const btn = elements.swapBtn;
+
+    // Don't update if button is in loading state
+    if (btn.classList.contains('loading')) {
+        return;
+    }
+
+    if (!wallet.isConnected()) {
+        btn.textContent = 'Connect Wallet';
+        btn.disabled = false;
+        return;
+    }
+
+    if (!wallet.isCorrectNetwork()) {
+        btn.textContent = `Switch to ${CONFIG.chainName}`;
+        btn.disabled = false;
+        return;
+    }
+
+    if (state.isRecalculating) {
+        btn.textContent = 'Recalculating...';
+        btn.disabled = true;
+        return;
+    }
+
+    if (!state.sellAmount || parseFloat(state.sellAmount) === 0) {
+        btn.textContent = 'Enter amount';
+        btn.disabled = true;
+        return;
+    }
+
+    // Require all data to be loaded - no fallbacks
+    if (!state.currentPrice) {
+        btn.textContent = 'Loading price...';
+        btn.disabled = true;
+        return;
+    }
+
+    if (volatility.lastCandleVol === null && volatility.lastIQR === null) {
+        btn.textContent = 'Loading volatility...';
+        btn.disabled = true;
+        return;
+    }
+
+    if (!gasOracle.isReady()) {
+        btn.textContent = 'Loading gas data...';
+        btn.disabled = true;
+        return;
+    }
+
+    if (!state.buyAmount || parseFloat(state.buyAmount) === 0) {
+        btn.textContent = 'Waiting for price...';
+        btn.disabled = true;
+        return;
+    }
+
+    btn.textContent = 'Create Swap';
+    btn.disabled = false;
+}
+
+/**
+ * Check if user has accepted risks for this wallet
+ */
+function hasAcceptedRisk() {
+    if (!wallet.address) return false;
+    const accepted = localStorage.getItem(`openswap_risk_accepted_${wallet.address.toLowerCase()}`);
+    return accepted === 'true';
+}
+
+/**
+ * Show risk acceptance modal and return promise that resolves when accepted
+ */
+function showRiskModal() {
+    return new Promise((resolve, reject) => {
+        const modal = document.getElementById('riskModal');
+        const acceptBtn = document.getElementById('riskAccept');
+        const declineBtn = document.getElementById('riskDecline');
+
+        if (!modal || !acceptBtn || !declineBtn) {
+            console.error('[App] Risk modal elements not found');
+            resolve(true); // Allow swap to proceed if modal missing
+            return;
+        }
+
+        modal.classList.add('active');
+
+        const handleAccept = () => {
+            localStorage.setItem(`openswap_risk_accepted_${wallet.address.toLowerCase()}`, 'true');
+            modal.classList.remove('active');
+            acceptBtn.removeEventListener('click', handleAccept);
+            declineBtn.removeEventListener('click', handleDecline);
+            resolve(true);
+        };
+
+        const handleDecline = () => {
+            modal.classList.remove('active');
+            acceptBtn.removeEventListener('click', handleAccept);
+            declineBtn.removeEventListener('click', handleDecline);
+            reject(new Error('Risk not accepted'));
+        };
+
+        acceptBtn.addEventListener('click', handleAccept);
+        declineBtn.addEventListener('click', handleDecline);
+    });
+}
+
+async function handleSwap() {
+    if (!wallet.isConnected()) {
+        handleConnect();
+        return;
+    }
+
+    if (!wallet.isCorrectNetwork()) {
+        try {
+            await wallet.switchNetwork(CONFIG.chainId);
+        } catch (error) {
+            showToast('Network Error', 'Failed to switch network', 'error');
+        }
+        return;
+    }
+
+    // Check risk acceptance
+    if (!hasAcceptedRisk()) {
+        try {
+            await showRiskModal();
+        } catch (e) {
+            return; // User declined
+        }
+    }
+
+    if (!state.sellAmount || !state.buyAmount) {
+        return;
+    }
+
+    // Check $45 notional limit
+    const sellAmt = parseFloat(state.sellAmount);
+    const notionalUsd = state.sellToken.symbol === 'ETH' ? sellAmt * state.currentPrice : sellAmt;
+    if (notionalUsd > 45) {
+        showToast('Limit Exceeded', 'Maximum swap size is $45', 'error');
+        return;
+    }
+
+    try {
+        setButtonLoading(elements.swapBtn, true);
+
+        // Parse amounts
+        const sellAmountWei = parseTokenAmount(state.sellAmount, state.sellToken.decimals);
+        const buyAmountWei = parseTokenAmount(state.buyAmount, state.buyToken.decimals);
+
+        // Calculate min out with slippage (1e7 precision to match toleranceRange)
+        const toleranceRange = Math.floor((state.settings.slippage / 100) * 1e7);
+        let minOutWei = buyAmountWei - (buyAmountWei * BigInt(toleranceRange) / BigInt(10000000));
+
+        // Account for fulfillment fee (contract deducts fee from fulfillAmt before comparing to minOut)
+        // Fee is in 1e7 scale, e.g., 1000 = 0.01%
+        const fulfillFee = BigInt(CONFIG.defaults.maxFee);
+        minOutWei = minOutWei - (minOutWei * fulfillFee / BigInt(10000000));
+
+        // Use a higher minFulfillLiquidity to ensure matcher provides enough
+        const minFulfillLiquidity = buyAmountWei + (buyAmountWei * BigInt(500) / BigInt(10000)); // +5% buffer
+
+        // Get values from inputs
+        const expirationSeconds = parseInt(elements.expirationInput.value) || 30;
+        const settlementTime = parseInt(elements.settlementTimeInput.value) || CONFIG.defaults.settlementTime;
+
+        // Update gas oracle if needed
+        await gasOracle.update(wallet.provider);
+
+        // Calculate gas compensation (900k L2 gas + L1 data fee)
+        // gasOracle uses its own effective gas price (baseFee + 15% tip)
+        const gasCompWei = gasOracle.getMatchCost();
+        const gasComp = parseFloat(ethers.formatEther(gasCompWei));
+
+        // Calculate settler reward (includes 25% spread and low gas minimum)
+        // Use max of: gas-based calculation OR 0.001% of notional
+        const gasBasedSettlerRewardWei = gasOracle.getSettleCost();
+        const gasBasedSettlerReward = parseFloat(ethers.formatEther(gasBasedSettlerRewardWei));
+        const notionalBasedSettlerReward = (notionalUsd * 0.00001) / state.currentPrice; // 0.001% of notional in ETH
+        const defaultSettlerReward = Math.max(gasBasedSettlerReward, notionalBasedSettlerReward);
+        const settlerRewardInput = elements.settlerRewardInput.value;
+        const settlerReward = settlerRewardInput && settlerRewardInput !== ''
+            ? parseFloat(settlerRewardInput)
+            : defaultSettlerReward;
+
+        // Calculate price tolerated (using 1e18 precision to match oracle)
+        const priceTolerated = (sellAmountWei * BigInt(10 ** 18)) / buyAmountWei;
+
+        // Preflight checks - these should never be zero
+        if (priceTolerated === BigInt(0)) {
+            showToast('Invalid Parameters', 'priceTolerated cannot be zero', 'error');
+            return;
+        }
+        if (toleranceRange === 0) {
+            showToast('Invalid Parameters', 'toleranceRange cannot be zero - check slippage', 'error');
+            return;
+        }
+        if (volatility.getRecommendedSlippage() === 0) {
+            showToast('Volatility Error', 'Unable to calculate volatility - try again', 'error');
+            return;
+        }
+
+        // Initial liquidity: max(10% of sellAmt, dispute gas cost / 0.01%)
+        // 0.01% constraint means gas cost should be <= 0.01% of init liq
+        // Uses floored gas cost for init liq (clamps baseFee to 0.001 gwei in low gas regime)
+        const gasCostWei = gasOracle.getDisputeCostForInitLiq();
+        const tenPercentSell = sellAmountWei * BigInt(10) / BigInt(100);
+        let minInitLiq;
+        if (state.sellToken.address === ethers.ZeroAddress) {
+            // Selling ETH: minInitLiq = gasCost / 0.0001 = gasCost * 10000
+            minInitLiq = gasCostWei * BigInt(10000);
+        } else {
+            // Selling USDC: convert gas cost to USD then to USDC units
+            const gasCostEth = parseFloat(ethers.formatEther(gasCostWei));
+            const gasCostUsd = gasCostEth * state.currentPrice;
+            const minInitLiqUsd = gasCostUsd * 10000;  // gasCost / 0.01%
+            minInitLiq = BigInt(Math.ceil(minInitLiqUsd * 1e6));
+        }
+
+        // Use manual initial liquidity if provided, otherwise use calculated
+        const initLiqInput = elements.initialLiquidityInput.value;
+        let initialLiquidity;
+        if (initLiqInput && initLiqInput !== '' && initLiqInput !== 'auto') {
+            // Manual input - parse based on sell token
+            if (state.sellToken.address === ethers.ZeroAddress) {
+                initialLiquidity = ethers.parseEther(initLiqInput);
+            } else {
+                initialLiquidity = BigInt(Math.floor(parseFloat(initLiqInput) * 1e6));
+            }
+        } else {
+            initialLiquidity = tenPercentSell > minInitLiq ? tenPercentSell : minInitLiq;
+        }
+        // Escalation halt is 3x sell amount (in sellToken units)
+        const escalationHalt = sellAmountWei * BigInt(3);
+
+        // Calculate bounty based on 4-second volatility
+        // Get 4-second σ as decimal
+        let vol4s;
+        if (volatility.lastKrakenVol !== null) {
+            vol4s = volatility.lastKrakenVol / 6.5; // already 4s, remove multiplier
+        } else if (volatility.lastCandleVol !== null) {
+            vol4s = (volatility.lastCandleVol / 1.5) / Math.sqrt(15); // remove 1.5x, scale 1-min to 4-sec
+        } else {
+            vol4s = 0.001; // fallback
+        }
+
+        let initLiqUsd;
+        if (state.sellToken.address === ethers.ZeroAddress) {
+            initLiqUsd = parseFloat(ethers.formatEther(initialLiquidity)) * state.currentPrice;
+        } else {
+            initLiqUsd = parseFloat(initialLiquidity.toString()) / 1e6;
+        }
+
+        // bountyStartAmt = 0.5 * vol_4s * initLiq, min 0.0065%, capped at 0.2%
+        const minBountyStartUsd = initLiqUsd * 0.000065; // 0.0065% floor
+        const maxBountyStartUsd = initLiqUsd * 0.002; // 0.2% cap
+        let bountyStartUsd = Math.max(0.5 * vol4s * initLiqUsd, minBountyStartUsd);
+        bountyStartUsd = Math.min(bountyStartUsd, maxBountyStartUsd);
+
+        // totalAmtDeposited = max(0.15% of initLiq, 2 * bountyStartAmt)
+        const minTotalUsd = initLiqUsd * 0.0015; // 0.15% floor
+        const totalBountyUsd = Math.max(minTotalUsd, bountyStartUsd * 2);
+
+        // Use USDC for bounty when selling USDC, ETH when selling ETH
+        const isSellingUsdc = state.sellToken.address !== ethers.ZeroAddress;
+        let bountyToken, bountyStartWei, bountyWei;
+        if (isSellingUsdc) {
+            // USDC bounty (6 decimals, 1 USDC = $1)
+            bountyToken = CONFIG.tokens.USDC;
+            bountyStartWei = BigInt(Math.floor(bountyStartUsd * 1e6));
+            bountyWei = BigInt(Math.floor(totalBountyUsd * 1e6));
+        } else {
+            // ETH bounty (18 decimals)
+            bountyToken = '0x0000000000000000000000000000000000000000';
+            const bountyStartEth = bountyStartUsd / state.currentPrice;
+            const totalBountyEth = totalBountyUsd / state.currentPrice;
+            bountyStartWei = ethers.parseEther(bountyStartEth.toFixed(18));
+            bountyWei = ethers.parseEther(totalBountyEth.toFixed(18));
+        }
+
+        const swapParams = {
+            sellAmount: sellAmountWei.toString(),
+            sellToken: state.sellToken.address,
+            minOut: minOutWei.toString(),
+            buyToken: state.buyToken.address,
+            minFulfillLiquidity: minFulfillLiquidity.toString(),
+            expirationSeconds: expirationSeconds,
+            gasCompensation: gasComp,
+            oracleParams: {
+                settlerReward: ethers.parseEther(settlerReward.toFixed(18)).toString(),
+                initialLiquidity: initialLiquidity.toString(),
+                escalationHalt: escalationHalt.toString(),
+                settlementTime: settlementTime,
+                latencyBailout: CONFIG.defaults.latencyBailout,
+                maxGameTime: CONFIG.defaults.maxGameTime,
+                blocksPerSecond: 500,
+                disputeDelay: CONFIG.defaults.disputeDelay,
+                swapFee: CONFIG.defaults.swapFee,
+                protocolFee: CONFIG.defaults.protocolFee,
+                multiplier: 130,
+                timeType: true
+            },
+            slippageParams: {
+                priceTolerated: priceTolerated.toString(),
+                toleranceRange: toleranceRange
+            },
+            fulfillFeeParams: {
+                maxFee: CONFIG.defaults.maxFee,
+                startingFee: CONFIG.defaults.startingFee,
+                roundLength: CONFIG.defaults.roundLength,
+                growthRate: CONFIG.defaults.growthRate,
+                maxRounds: CONFIG.defaults.maxRounds
+            },
+            // BountyParams - use USDC when selling USDC, ETH when selling ETH
+            bountyParams: {
+                totalAmtDeposited: bountyWei.toString(),
+                bountyStartAmt: bountyStartWei.toString(),
+                roundLength: 1,
+                bountyToken: bountyToken,
+                bountyMultiplier: 11401,
+                maxRounds: 20
+            }
+        };
+
+        // Preflight checks on swapParams
+        if (swapParams.expirationSeconds > 60) {
+            showToast('Invalid Parameters', 'Expiration cannot exceed 60 seconds', 'error');
+            return;
+        }
+        if (swapParams.oracleParams.settlementTime > 60) {
+            showToast('Invalid Parameters', 'Settlement time cannot exceed 60 seconds', 'error');
+            return;
+        }
+        if (swapParams.fulfillFeeParams.maxFee > 20000) {
+            showToast('Invalid Parameters', 'Fulfillment fee cannot exceed 0.2%', 'error');
+            return;
+        }
+        if (swapParams.gasCompensation > 0.01) {
+            showToast('Invalid Parameters', 'Gas compensation cannot exceed 0.01 ETH', 'error');
+            return;
+        }
+
+        // Check bounty limits based on token
+        const bountyAmt = BigInt(swapParams.bountyParams.totalAmtDeposited);
+        const bountyTokenAddr = swapParams.bountyParams.bountyToken;
+        if (bountyTokenAddr === '0x0000000000000000000000000000000000000000') {
+            // ETH: max 0.05 ETH
+            if (bountyAmt > ethers.parseEther('0.05')) {
+                showToast('Invalid Parameters', 'ETH bounty cannot exceed 0.05 ETH', 'error');
+                return;
+            }
+        } else if (bountyTokenAddr === CONFIG.tokens.USDC) {
+            // USDC: max 100 USDC (6 decimals)
+            if (bountyAmt > BigInt(100 * 1e6)) {
+                showToast('Invalid Parameters', 'USDC bounty cannot exceed 100 USDC', 'error');
+                return;
+            }
+        } else if (bountyTokenAddr === CONFIG.tokens.OP) {
+            // OP: max 300 OP (18 decimals)
+            if (bountyAmt > ethers.parseEther('300')) {
+                showToast('Invalid Parameters', 'OP bounty cannot exceed 300 OP', 'error');
+                return;
+            }
+        }
+
+        console.log('Creating swap with params:', swapParams);
+
+        const result = await openSwap.createSwap(swapParams);
+
+        showToast('Swap Created', `Transaction confirmed!`, 'success');
+
+        // Start tracking the swap if we got a swapId
+        if (result && result.swapId) {
+            // Format minOut for display
+            const minOutFormatted = formatTokenAmount(minOutWei.toString(), state.buyToken.decimals);
+            statusTracker.startTracking(result.swapId, result.txHash, {
+                sellAmount: state.sellAmount,
+                sellToken: state.sellToken.symbol,
+                buyToken: state.buyToken.symbol,
+                minReceived: minOutFormatted,
+                gasCompensation: swapParams.gasCompensation,
+                bountyToken: swapParams.bountyParams.bountyToken
+            });
+
+            // Scroll to status tracker
+            setTimeout(() => {
+                const statusEl = document.getElementById('statusTracker');
+                if (statusEl) {
+                    statusEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }
+            }, 100);
+        }
+
+        // Reset form
+        state.sellAmount = '';
+        state.buyAmount = '';
+        elements.sellAmount.value = '';
+        elements.buyAmount.value = '';
+        elements.swapDetails.classList.remove('visible');
+        updateSwapButton();
+        updateBalances();
+
+    } catch (error) {
+        console.error('Swap error:', error);
+        showToast('Swap Failed', error.message || 'Transaction failed', 'error');
+    } finally {
+        setButtonLoading(elements.swapBtn, false);
+        updateSwapButton();
+    }
+}
+
+/**
+ * Toggle advanced settings
+ */
+function toggleAdvanced() {
+    elements.advancedToggle.classList.toggle('open');
+    elements.advancedPanel.classList.toggle('open');
+}
+
+/**
+ * Toggle cost breakdown panel
+ */
+function toggleCostBreakdown() {
+    elements.costBreakdownToggle.classList.toggle('expanded');
+    elements.costBreakdownPanel.classList.toggle('visible');
+}
+
+/**
+ * Update gas debug display with L1/L2 breakdown
+ */
+function updateGasDebug() {
+    if (!gasOracle.isReady()) return;
+
+    try {
+        const params = gasOracle.getRawParams();
+        const swapBreakdown = gasOracle.getSwapCostBreakdown();
+        const matchBreakdown = gasOracle.getMatchCostBreakdown();
+        const settleBreakdown = gasOracle.getSettleCostBreakdown();
+
+        // Format wei to gwei with appropriate precision
+        const formatGwei = (wei) => {
+            if (wei === null || wei === undefined) return '—';
+            const num = typeof wei === 'bigint' ? Number(wei) : wei;
+            const gwei = num / 1e9;
+            if (gwei < 0.001) return `${num} wei`;
+            if (gwei < 1) return `${gwei.toFixed(6)} gwei`;
+            return `${gwei.toFixed(3)} gwei`;
+        };
+
+        // Format ETH with appropriate precision
+        const formatEth = (wei) => {
+            if (wei === null || wei === undefined) return '—';
+            const num = typeof wei === 'bigint' ? Number(wei) : wei;
+            if (num === 0) return '0 ETH';
+            const eth = num / 1e18;
+            if (eth < 0.000001) return `${(num / 1e9).toFixed(4)} gwei`;  // Show in gwei for very small
+            if (eth < 0.0001) return `${(eth * 1e6).toFixed(4)} µETH`;
+            return `${eth.toFixed(6)} ETH`;
+        };
+
+        // Update base fee info
+        elements.gasDebugBaseFee.textContent = formatGwei(params.baseFee);
+        elements.gasDebugL1BaseFee.textContent = formatGwei(params.l1BaseFee);
+        elements.gasDebugEffective.textContent = formatGwei(params.effectiveGasPrice);
+        elements.gasDebugLowGas.textContent = params.isLowGasRegime ? 'YES (< 20k wei)' : 'No';
+
+        // Update swap creation costs
+        elements.gasDebugSwapL2.textContent = formatEth(swapBreakdown.l2Cost);
+        elements.gasDebugSwapL1.textContent = formatEth(swapBreakdown.l1Cost);
+        elements.gasDebugSwapTotal.textContent = formatEth(swapBreakdown.total);
+
+        // Update match costs
+        elements.gasDebugMatchL2.textContent = formatEth(matchBreakdown.l2Cost);
+        elements.gasDebugMatchL1.textContent = formatEth(matchBreakdown.l1Cost);
+        elements.gasDebugMatchTotal.textContent = formatEth(matchBreakdown.total);
+
+        // Update settle costs
+        elements.gasDebugSettleL2.textContent = formatEth(settleBreakdown.l2Cost);
+        elements.gasDebugSettleL1.textContent = formatEth(settleBreakdown.l1Cost);
+        elements.gasDebugSettleTotal.textContent = formatEth(settleBreakdown.final);
+
+    } catch (e) {
+        console.error('Error updating gas debug:', e);
+    }
+}
+
+/**
+ * Update cost breakdown estimates
+ * - Fulfillment fee: from config (e.g., 0.02%)
+ * - Initial reporter reward: ~80% of IQR * (initial liquidity / swap notional)
+ *   Default initial liquidity is 10% of swap, so: 0.8 * IQR * 0.10 = 0.08 * IQR
+ * - Other gas: ~1M gas converted to USD, then as % of swap amount
+ */
+async function updateCostBreakdown() {
+    if (!state.sellAmount || !state.currentPrice) {
+        elements.estTotalCost.textContent = '-';
+        elements.costFulfillmentFee.textContent = '-';
+        elements.costReporterReward.textContent = '-';
+        elements.costOtherGas.textContent = '-';
+        return;
+    }
+
+    try {
+        const sellAmt = parseFloat(state.sellAmount);
+        if (isNaN(sellAmt) || sellAmt <= 0) return;
+
+        // Calculate swap notional in USD
+        let swapNotionalUsd;
+        if (state.sellToken.address === ethers.ZeroAddress) {
+            swapNotionalUsd = sellAmt * state.currentPrice;
+        } else {
+            swapNotionalUsd = sellAmt; // USDC
+        }
+
+        // 1. Fulfillment fee: max(minFee, min(maxFee, 25% of 4-second volatility from Kraken))
+        const minFeePct = CONFIG.defaults.startingFee / 100000; // e.g., 750 -> 0.0075%
+        const maxFeePct = CONFIG.defaults.maxFee / 100000; // e.g., 2000 -> 0.02%
+        let fulfillmentFeePct = maxFeePct;
+        if (volatility.lastKrakenVol !== null) {
+            const vol4s = volatility.lastKrakenVol / 6.5; // Convert 6.5σ to raw 4s σ
+            const volBasedFeePct = 0.25 * vol4s * 100; // 25% of 4s vol as percentage
+            fulfillmentFeePct = Math.max(minFeePct, Math.min(maxFeePct, volBasedFeePct));
+        }
+
+        // 2. Initial reporter reward: ~80% of vol * (initial liquidity ratio)
+        // Get initial liquidity ratio from input value or placeholder
+        let initLiqRatio = 0.10; // default
+        const initLiqInput = elements.initialLiquidityInput.value || elements.initialLiquidityInput.placeholder;
+        if (initLiqInput && initLiqInput !== '' && initLiqInput !== 'auto' && state.sellAmount) {
+            const initLiqValue = parseFloat(initLiqInput);
+            if (!isNaN(initLiqValue) && initLiqValue > 0) {
+                initLiqRatio = initLiqValue / sellAmt;
+            }
+        }
+
+        // Volatility from tracker (use IQR if available, otherwise candle vol scaled to 4s)
+        // IQR is already 4-second based; candle vol is 1-minute, so divide by sqrt(15) to get 4s
+        let vol;
+        if (volatility.lastIQR !== null) {
+            vol = volatility.lastIQR;
+        } else if (volatility.lastCandleVol !== null) {
+            vol = volatility.lastCandleVol / Math.sqrt(15); // 1-min to 4-sec
+        } else {
+            return;
+        }
+        const reporterRewardPct = 0.8 * vol * initLiqRatio * 100; // as percentage
+
+        // 3. Other gas: swap creation gas + gasCompensation
+        if (!gasOracle.isReady()) return;
+        // Swap creation: ~500k gas using MetaMask's suggested gas price
+        let swapCreationCostEth = 0;
+        try {
+            const provider = wallet.provider;
+            if (provider) {
+                // Use getGasPrice() directly - Optimism doesn't support EIP-1559 priority fees
+                const gasPrice = await provider.getGasPrice();
+                const swapCreationGas = BigInt(500000);
+                const swapCreationCostWei = swapCreationGas * gasPrice;
+                swapCreationCostEth = parseFloat(ethers.formatEther(swapCreationCostWei));
+            }
+        } catch (e) {
+            // Fallback to gas oracle if MetaMask unavailable
+            const effectiveGasPrice = gasOracle.getEffectiveGasPrice();
+            const swapCreationGas = BigInt(500000);
+            const swapCreationCostWei = swapCreationGas * effectiveGasPrice;
+            swapCreationCostEth = parseFloat(ethers.formatEther(swapCreationCostWei));
+        }
+        // gasCompensation from gas oracle
+        const gasCompWei = gasOracle.getMatchCost();
+        const gasCompEth = parseFloat(ethers.formatEther(gasCompWei));
+        // Total gas cost
+        const totalGasEth = swapCreationCostEth + gasCompEth;
+        const gasCostUsd = totalGasEth * state.currentPrice;
+        const otherGasPct = (gasCostUsd / swapNotionalUsd) * 100;
+
+        // Total
+        const totalPct = fulfillmentFeePct + reporterRewardPct + otherGasPct;
+
+        // Update UI
+        elements.estTotalCost.textContent = `~${totalPct.toFixed(3)}%`;
+        elements.costFulfillmentFee.textContent = `${fulfillmentFeePct.toFixed(3)}%`;
+        elements.costReporterReward.textContent = `${reporterRewardPct.toFixed(3)}%`;
+        elements.costOtherGas.textContent = `${otherGasPct.toFixed(3)}%`;
+
+    } catch (e) {
+        console.error('Error updating cost breakdown:', e);
+    }
+}
+
+/**
+ * Handle load order by ID
+ */
+async function handleLoadOrder() {
+    const swapId = elements.loadOrderInput.value.trim();
+
+    if (!swapId) {
+        showToast('Error', 'Please enter a Swap ID', 'error');
+        return;
+    }
+
+    if (!wallet.isConnected()) {
+        showToast('Error', 'Please connect your wallet first', 'error');
+        return;
+    }
+
+    try {
+        // Check if swap ID is valid (must be < nextSwapId and > 0)
+        const nextId = await openSwap.getNextSwapId();
+        const swapIdNum = parseInt(swapId);
+
+        if (isNaN(swapIdNum) || swapIdNum < 1 || swapIdNum >= Number(nextId)) {
+            showToast('Error', 'Swap not found', 'error');
+            return;
+        }
+
+        // Fetch the swap
+        const swap = await openSwap.getSwap(swapId);
+
+        // Check if swap exists (active is set to true on creation)
+        if (!swap.active && !swap.matched && !swap.finished && !swap.cancelled) {
+            showToast('Error', 'Swap not found', 'error');
+            return;
+        }
+
+        // Check if we are the swapper
+        if (swap.swapper.toLowerCase() !== wallet.address.toLowerCase()) {
+            showToast('Error', 'This swap belongs to a different address', 'error');
+            return;
+        }
+
+        // Check if already finished
+        if (swap.finished) {
+            showToast('Info', `Swap #${swapId} has already been executed`, 'info');
+            return;
+        }
+
+        // Check if cancelled
+        if (swap.cancelled) {
+            showToast('Info', `Swap #${swapId} was cancelled`, 'info');
+            return;
+        }
+
+        // Save to localStorage
+        openSwap.saveSwapId(swapId, wallet.address);
+
+        // Clear input and reload orders
+        elements.loadOrderInput.value = '';
+        showToast('Success', `Loaded swap #${swapId}`, 'success');
+        loadUserOrders();
+
+    } catch (error) {
+        console.error('Load order error:', error);
+        showToast('Error', 'Failed to load swap. Check the ID.', 'error');
+    }
+}
+
+/**
+ * Render orders list from state (applies optimistic updates)
+ */
+function renderOrdersList() {
+    if (!elements.ordersList || state.userOrders.length === 0) return;
+
+    // Apply optimistic matched updates with bailout info
+    const ordersToRender = state.userOrders.map(order => {
+        if (state.matchedSwapIds.has(order.swapId)) {
+            const bailoutDeadline = state.matchedSwapIds.get(order.swapId);
+            const now = Math.floor(Date.now() / 1000);
+            const latencyTimeRemaining = bailoutDeadline ? Math.max(0, bailoutDeadline - now) : null;
+            const canBailOut = latencyTimeRemaining !== null && latencyTimeRemaining <= 0;
+            return {
+                ...order,
+                matched: true,
+                bailoutInfo: {
+                    canBailOut: canBailOut,
+                    canSettle: false,
+                    countdown: latencyTimeRemaining,
+                    reason: canBailOut ? 'No initial report' : 'Awaiting report',
+                    hasInitialReport: false,
+                    isDistributed: false,
+                    latencyBailoutAvailable: canBailOut,
+                    maxGameTimeBailoutAvailable: false,
+                    latencyTimeRemaining: latencyTimeRemaining,
+                    maxGameTimeRemaining: null, // Unknown in optimistic mode
+                    reportId: order.reportId
+                }
+            };
+        }
+        return order;
+    });
+
+    elements.ordersList.innerHTML = ordersToRender.map(order => renderOrderRow(order)).join('');
+
+    // Add action handlers
+    elements.ordersList.querySelectorAll('.order-action-btn').forEach(btn => {
+        const action = btn.dataset.action;
+        const swapId = btn.dataset.swapId;
+        const reportId = btn.dataset.reportId;
+
+        btn.addEventListener('click', async () => {
+            if (action === 'cancel') {
+                await handleCancel(swapId, btn);
+            } else if (action === 'bailout') {
+                await handleBailOut(swapId, btn);
+            } else if (action === 'settle') {
+                await handleSettle(reportId, btn);
+            }
+        });
+    });
+}
+
+/**
+ * Update countdown displays without re-fetching (called every second)
+ */
+function updateCountdowns() {
+    let needsRerender = false;
+    document.querySelectorAll('.order-bailout-status.countdown').forEach(el => {
+        const text = el.textContent;
+
+        // Parse various countdown formats: "Xs", "Xm Ys", "Xh Ym"
+        let totalSeconds = 0;
+        const hoursMatch = text.match(/(\d+)h/);
+        const minsMatch = text.match(/(\d+)m/);
+        const secsMatch = text.match(/(\d+)s/);
+
+        if (hoursMatch) totalSeconds += parseInt(hoursMatch[1]) * 3600;
+        if (minsMatch) totalSeconds += parseInt(minsMatch[1]) * 60;
+        if (secsMatch) totalSeconds += parseInt(secsMatch[1]);
+
+        if (totalSeconds > 0) {
+            totalSeconds--;
+            if (totalSeconds <= 0) {
+                // Countdown finished - need full re-render
+                needsRerender = true;
+            } else {
+                // Extract prefix (everything before the time)
+                const prefix = text.replace(/\d+[hms]\s*/g, '').replace(/\s+$/, '');
+                el.textContent = `${prefix} ${formatCountdown(totalSeconds)}`;
+            }
+        }
+    });
+    if (needsRerender) {
+        loadUserOrders();
+    }
+}
+
+/**
+ * Load user orders
+ */
+async function loadUserOrders() {
+    if (!wallet.isConnected()) {
+        elements.ordersList.innerHTML = `
+            <div class="empty-state">
+                <svg class="empty-state-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1">
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                    <line x1="3" y1="9" x2="21" y2="9"></line>
+                    <line x1="9" y1="21" x2="9" y2="9"></line>
+                </svg>
+                <h3>Connect wallet</h3>
+                <p>Connect your wallet to view your orders</p>
+            </div>
+        `;
+        return;
+    }
+
+    try {
+        const orders = await openSwap.getUserSwaps(wallet.address);
+
+        // Clear optimistic flags for orders that are now confirmed matched
+        orders.forEach(order => {
+            if (order.matched && state.matchedSwapIds.has(order.swapId)) {
+                state.matchedSwapIds.delete(order.swapId);
+            }
+        });
+
+        state.userOrders = orders;
+
+        if (orders.length === 0) {
+            elements.ordersList.innerHTML = `
+                <div class="empty-state">
+                    <svg class="empty-state-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1">
+                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                        <line x1="3" y1="9" x2="21" y2="9"></line>
+                        <line x1="9" y1="21" x2="9" y2="9"></line>
+                    </svg>
+                    <h3>No orders yet</h3>
+                    <p>Create your first swap to get started</p>
+                </div>
+            `;
+            return;
+        }
+
+        renderOrdersList();
+    } catch (error) {
+        console.error('Failed to load user orders:', error);
+        showToast('Error', 'Failed to load orders', 'error');
+    }
+}
+
+
+/**
+ * Render order row
+ */
+function renderOrderRow(order) {
+    const sellToken = getToken(order.sellToken) || { symbol: 'UNK', decimals: 18, logo: null };
+    const buyToken = getToken(order.buyToken) || { symbol: 'UNK', decimals: 18, logo: null };
+
+    const sellAmount = formatTokenAmount(order.sellAmt.toString(), sellToken.decimals);
+    const buyAmount = formatTokenAmount(order.minOut.toString(), buyToken.decimals);
+
+    let status = 'active';
+    let statusText = 'Active';
+
+    if (order.finished) {
+        status = 'completed';
+        statusText = 'Completed';
+    } else if (order.matched) {
+        status = 'matched';
+        statusText = 'Matched';
+    } else if (order.cancelled) {
+        status = 'completed';
+        statusText = 'Cancelled';
+    }
+
+    const canCancel = order.active && !order.matched && !order.cancelled && !order.finished;
+
+    // Use bailoutInfo if available, otherwise fall back to simple check
+    const bailoutInfo = order.bailoutInfo;
+    const canBailOut = bailoutInfo ? bailoutInfo.canBailOut : (order.matched && !order.finished && !order.cancelled);
+
+    const sellIconHtml = sellToken.logo
+        ? `<img src="${sellToken.logo}" alt="${sellToken.symbol}" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><span style="display:none">${sellToken.symbol.slice(0, 2)}</span>`
+        : `<span>${sellToken.symbol.slice(0, 2)}</span>`;
+
+    const buyIconHtml = buyToken.logo
+        ? `<img src="${buyToken.logo}" alt="${buyToken.symbol}" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><span style="display:none">${buyToken.symbol.slice(0, 2)}</span>`
+        : `<span>${buyToken.symbol.slice(0, 2)}</span>`;
+
+    // Build bailout/settle status display for matched orders
+    let statusInfoHtml = '';
+    const canSettle = bailoutInfo?.canSettle || false;
+    const reportId = bailoutInfo?.reportId?.toString() || order.reportId?.toString();
+
+    if (order.matched && !order.finished && bailoutInfo) {
+        // Primary status line
+        if (bailoutInfo.reason) {
+            if (canBailOut) {
+                // Bailout available - show reason as warning
+                statusInfoHtml = `<div class="order-bailout-status available">${bailoutInfo.reason}</div>`;
+            } else if (canSettle) {
+                // Ready to settle
+                statusInfoHtml = `<div class="order-bailout-status available">${bailoutInfo.reason}</div>`;
+            } else if (bailoutInfo.countdown !== null && bailoutInfo.countdown > 0) {
+                // Show countdown (either latency bailout or settlement countdown)
+                statusInfoHtml = `<div class="order-bailout-status countdown">${bailoutInfo.reason} ${formatCountdown(bailoutInfo.countdown)}</div>`;
+            } else {
+                statusInfoHtml = `<div class="order-bailout-status">${bailoutInfo.reason}</div>`;
+            }
+        }
+
+        // Also show maxGameTime as backup bailout countdown (if not already bailing out)
+        if (!canBailOut && bailoutInfo.maxGameTimeRemaining !== null && bailoutInfo.maxGameTimeRemaining > 0) {
+            statusInfoHtml += `<div class="order-bailout-status countdown" style="opacity: 0.7; font-size: 10px;">Safety bailout: ${formatCountdown(bailoutInfo.maxGameTimeRemaining)}</div>`;
+        }
+    }
+
+    return `
+        <div class="order-row">
+            <div class="order-pair">
+                <div class="order-pair-icons">
+                    <div class="token-icon">${sellIconHtml}</div>
+                    <div class="token-icon">${buyIconHtml}</div>
+                </div>
+                <span>${sellToken.symbol}/${buyToken.symbol}</span>
+            </div>
+            <div class="order-amount">${sellAmount}</div>
+            <div class="order-amount">${buyAmount}</div>
+            <div>
+                <span class="order-status ${status}">${statusText}</span>
+                ${statusInfoHtml}
+            </div>
+            <div class="order-actions">
+                ${canCancel ? `<button class="order-action-btn danger" data-action="cancel" data-swap-id="${order.swapId}">Cancel</button>` : ''}
+                ${canSettle ? `<button class="order-action-btn success" data-action="settle" data-report-id="${reportId}">Settle</button>` : ''}
+                ${canBailOut ? `<button class="order-action-btn" data-action="bailout" data-swap-id="${order.swapId}">Bail Out</button>` : ''}
+            </div>
+        </div>
+    `;
+}
+
+/**
+ * Format countdown seconds to human readable string
+ */
+function formatCountdown(seconds) {
+    if (seconds <= 0) return 'now';
+    if (seconds < 60) return `${seconds}s`;
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    if (mins < 60) return `${mins}m ${secs}s`;
+    const hours = Math.floor(mins / 60);
+    const remainMins = mins % 60;
+    return `${hours}h ${remainMins}m`;
+}
+
+/**
+ * Handle cancel order
+ */
+async function handleCancel(swapId, btn) {
+    try {
+        setButtonLoading(btn, true);
+        await openSwap.cancelSwap(swapId);
+        showToast('Order Cancelled', `Order #${swapId} has been cancelled`, 'success');
+        loadUserOrders();
+        // Refresh balances
+        updateBalances();
+        setTimeout(() => updateBalances(), 1000);
+        // Hide status tracker if this was the tracked swap
+        if (statusTracker.swapId === swapId) {
+            statusTracker.hide();
+        }
+    } catch (error) {
+        console.error('Cancel error:', error);
+        showToast('Cancel Failed', error.message || 'Transaction failed', 'error');
+    } finally {
+        setButtonLoading(btn, false, 'Cancel');
+    }
+}
+
+/**
+ * Handle bail out
+ */
+async function handleBailOut(swapId, btn) {
+    try {
+        setButtonLoading(btn, true);
+        await openSwap.bailOut(swapId);
+        showToast('Bail Out Success', `Order #${swapId} bail out completed`, 'success');
+        loadUserOrders();
+        statusTracker.hide();
+    } catch (error) {
+        console.error('Bail out error:', error);
+        showToast('Bail Out Failed', error.message || 'Transaction failed', 'error');
+    } finally {
+        setButtonLoading(btn, false, 'Bail Out');
+    }
+}
+
+/**
+ * Handle settle report
+ */
+async function handleSettle(reportId, btn) {
+    try {
+        setButtonLoading(btn, true);
+        await openSwap.settleReport(reportId);
+        showToast('Settlement Success', 'Report settled, swap executed!', 'success');
+        loadUserOrders();
+        updateBalances();
+        setTimeout(() => updateBalances(), 2000);
+    } catch (error) {
+        console.error('Settle error:', error);
+        showToast('Settlement Failed', error.message || 'Transaction failed', 'error');
+    } finally {
+        setButtonLoading(btn, false, 'Settle');
+    }
+}
+
+// Initialize app when DOM is ready
+document.addEventListener('DOMContentLoaded', init);
