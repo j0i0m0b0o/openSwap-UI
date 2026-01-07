@@ -4,7 +4,7 @@ A web interface for openSwap — an oracle-powered token swap protocol with trus
 
 ## Overview
 
-openSwap enables ETH/USDC swaps using an optimistic oracle mechanism instead of traditional AMM liquidity pools. Prices are determined through a decentralized reporting and dispute game, providing MEV-resistant execution with transparent pricing.
+openSwap enables ETH/USDC swaps using an optimistic oracle mechanism instead of traditional AMM liquidity pools. Prices are determined through a decentralized reporting and dispute game, providing good execution with transparent pricing.
 
 ### Key Features
 
