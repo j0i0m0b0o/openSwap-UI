@@ -210,15 +210,19 @@ class OpenSwapContract {
                 : BigInt(sellAmount);
             const allowance = await wallet.getAllowance(sellToken, this.address);
             if (allowance < totalNeeded) {
+                // Approve 0.5% more to handle minor param changes
+                const approveAmount = totalNeeded + (totalNeeded / 200n);
                 console.log('Approving token...');
-                await wallet.approve(sellToken, this.address, totalNeeded);
+                await wallet.approve(sellToken, this.address, approveAmount);
             }
         } else if (!isEthBounty) {
             // Selling ETH but using ERC20 bounty (edge case, but handle it)
             const allowance = await wallet.getAllowance(bountyParams.bountyToken, this.address);
             if (allowance < bountyTotalWei) {
+                // Approve 0.5% more to handle minor param changes
+                const approveAmount = bountyTotalWei + (bountyTotalWei / 200n);
                 console.log('Approving bounty token...');
-                await wallet.approve(bountyParams.bountyToken, this.address, bountyTotalWei);
+                await wallet.approve(bountyParams.bountyToken, this.address, approveAmount);
             }
         }
 
