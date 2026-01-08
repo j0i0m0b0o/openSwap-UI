@@ -101,15 +101,15 @@ contract openSwap is ReentrancyGuard {
     }
 
     struct BountyParams {
-        uint256 totalAmtDeposited;
-        uint256 bountyStartAmt;
-        uint256 roundLength;
-        address bountyToken;
-        uint16 bountyMultiplier;
-        uint16 maxRounds;
+        uint256 totalAmtDeposited; // max amount of bountyToken paid in the initial report bounty 
+        uint256 bountyStartAmt; // starting amount of bountyToken in the initial report bounty
+        uint256 roundLength; // length of time, in seconds, for each escalation round
+        address bountyToken; // token bounty is paid in. address(0) is for ETH
+        uint16 bountyMultiplier; // amount bounty escalate per round from bountyStartAmt. 14000 = 1.4x per round
+        uint16 maxRounds; // maximum rounds of escalation
     }
 
-    event SwapCreated(uint256 indexed swapId, address indexed swapper, uint256 sellAmt, address sellToken, uint256 minOut, address buyToken, uint256 minFulfillLiquidity, uint256 expiration, uint256 priceTolerated, uint256 toleranceRange, FulfillFeeParams fulfillFeeParams, uint256 blockTimestamp, OracleParams oracleParams, BountyParams bountyParams);
+    event SwapCreated(uint256 indexed swapId, address indexed swapper, uint256 sellAmt, address sellToken, uint256 minOut, address buyToken, uint256 minFulfillLiquidity, uint256 expiration, uint256 priceTolerated, uint256 toleranceRange, FulfillFeeParams fulfillFeeParams, uint256 blockTimestamp, OracleParams oracleParams, BountyParams bountyParams, uint256 gasCompensation);
     event SwapCancelled(uint256 swapId);
     event SingleFee(uint256 swapId, uint256 fulfillmentFee);
     event SwapRefunded(uint256 swapId, address indexed swapper, address indexed matcher);
@@ -209,7 +209,7 @@ contract openSwap is ReentrancyGuard {
             IERC20(bountyParams.bountyToken).safeTransferFrom(msg.sender, address(this), bountyParams.totalAmtDeposited);
         }
 
-        emit SwapCreated(swapId, s.swapper, sellAmt, sellToken, minOut, buyToken, minFulfillLiquidity, s.expiration, slippageParams.priceTolerated, slippageParams.toleranceRange, s.fulfillFeeParams, block.timestamp, s.oracleParams, s.bountyParams);
+        emit SwapCreated(swapId, s.swapper, sellAmt, sellToken, minOut, buyToken, minFulfillLiquidity, s.expiration, slippageParams.priceTolerated, slippageParams.toleranceRange, s.fulfillFeeParams, block.timestamp, s.oracleParams, s.bountyParams, gasCompensation);
         if (fulfillFeeParams.maxFee == fulfillFeeParams.startingFee && fulfillFeeParams.maxRounds == 1) {
             emit SingleFee(swapId, fulfillFeeParams.maxFee);
         }
