@@ -89,6 +89,11 @@ class StatusTracker {
         this.liveFeeInterval = null;
         this.submittedTimestamp = null;
 
+        // Live bounty state
+        this.liveBountyInterval = null;
+        this.matchedTimestamp = null;
+        this.bountyParams = null;
+
         // Prevent overlapping event checks
         this.isChecking = false;
 
@@ -147,6 +152,7 @@ class StatusTracker {
             // Matched details
             matchedBy: document.getElementById('matchedBy'),
             matchedFulfillFee: document.getElementById('matchedFulfillFee'),
+            liveBounty: document.getElementById('liveBounty'),
             latencyCountdownRow: document.getElementById('latencyCountdownRow'),
             latencyCountdown: document.getElementById('latencyCountdown'),
             bailoutRow: document.getElementById('bailoutRow'),
@@ -209,9 +215,14 @@ class StatusTracker {
 
         // Reset expense tracking
         this.bountyPaid = null; // Will be set from BountyInitialReportSubmitted event
-        this.bountyToken = orderInfo?.bountyToken || null;
+        this.bountyParams = orderInfo?.bountyParams || null;
+        this.bountyToken = this.bountyParams?.bountyToken || null;
         this.fulfillmentFee = null;
         this.gasCompensation = orderInfo?.gasCompensation || null;
+
+        // Reset live bounty state
+        this.stopLiveBountyTimer();
+        this.matchedTimestamp = null;
 
         // Reset auto-scroll state
         this.autoScrollEnabled = true;
@@ -612,6 +623,15 @@ class StatusTracker {
                 }
                 this.stopLiveFeeTimer();
 
+                // Start live bounty timer (shows escalating bounty while waiting for initial report)
+                // Delay display by 1s to avoid jarring pop-in/out on quick initial reports
+                this.matchedTimestamp = Date.now();
+                setTimeout(() => {
+                    if (this.isActive && !this.initialReportReceived) {
+                        this.startLiveBountyTimer();
+                    }
+                }, 1000);
+
                 // Start latency bailout countdown using block timestamp
                 this.startBailoutCountdown(timestamp);
 
@@ -671,8 +691,9 @@ class StatusTracker {
                 this.updateStep('matched', STEP_STATE.COMPLETED);
                 this.updateStep('initialReport', STEP_STATE.COMPLETED);
 
-                // If swap executed, initial report must have happened - ensure bailout is stopped
+                // If swap executed, initial report must have happened - ensure timers are stopped
                 this.initialReportReceived = true;
+                this.stopLiveBountyTimer();
                 this.stopLatencyCountdown();
                 this.stopSettleTimer();
                 if (this.elements.bailoutRow) {
@@ -899,8 +920,9 @@ class StatusTracker {
 
                 this.lastPrice = priceStr;
 
-                // Initial report received - stop bailout countdown
+                // Initial report received - stop bounty timer and bailout countdown
                 this.initialReportReceived = true;
+                this.stopLiveBountyTimer();
                 this.stopLatencyCountdown();
 
                 // Extract bountyPaid from this same transaction
@@ -1620,6 +1642,79 @@ class StatusTracker {
         if (this.liveFeeInterval) {
             clearInterval(this.liveFeeInterval);
             this.liveFeeInterval = null;
+        }
+    }
+
+    /**
+     * Start live bounty timer
+     * Shows escalating bounty while waiting for initial report
+     * bounty = bountyStartAmt * (bountyMultiplier/10000)^round, capped at totalAmtDeposited
+     * Displays in USD with 2 significant digits
+     */
+    startLiveBountyTimer() {
+        this.stopLiveBountyTimer();
+
+        if (!this.bountyParams || !this.elements.liveBounty) return;
+
+        const { totalAmtDeposited, bountyStartAmt, roundLength, bountyMultiplier, maxRounds, bountyToken, ethPrice } = this.bountyParams;
+        const isEthBounty = !bountyToken || bountyToken === '0x0000000000000000000000000000000000000000';
+        const decimals = isEthBounty ? 18 : 6; // ETH or USDC
+
+        // Format USD with 2 significant digits
+        const formatUsd = (value) => {
+            if (value === 0) return '$0.00';
+            if (value >= 1) return `$${value.toFixed(2)}`;
+            return `$${value.toPrecision(2)}`;
+        };
+
+        // Convert bounty amount to USD
+        const toUsd = (bountyRaw) => {
+            const amount = bountyRaw / (10 ** decimals);
+            if (isEthBounty) {
+                return amount * (ethPrice || 0);
+            }
+            return amount; // USDC is already USD
+        };
+
+        // Show initial bounty
+        this.elements.liveBounty.style.display = '';
+        const startUsd = toUsd(Number(bountyStartAmt));
+        this.elements.liveBounty.textContent = `Reporting Bounty: ${formatUsd(startUsd)}`;
+
+        const updateBounty = () => {
+            if (!this.matchedTimestamp || !this.elements.liveBounty) return;
+
+            const elapsed = (Date.now() - this.matchedTimestamp) / 1000; // seconds
+            const round = Math.floor(elapsed / roundLength);
+            const cappedRound = Math.min(round, maxRounds);
+
+            // Calculate: bountyStartAmt * (bountyMultiplier/10000)^cappedRound
+            let bounty = Number(bountyStartAmt);
+            for (let i = 0; i < cappedRound; i++) {
+                bounty = (bounty * bountyMultiplier) / 10000;
+            }
+
+            // Cap at totalAmtDeposited
+            bounty = Math.min(bounty, Number(totalAmtDeposited));
+
+            const bountyUsd = toUsd(bounty);
+            this.elements.liveBounty.textContent = `Reporting Bounty: ${formatUsd(bountyUsd)}`;
+        };
+
+        // Update every 2 seconds (respects Optimism block time)
+        this.liveBountyInterval = setInterval(updateBounty, 2000);
+    }
+
+    /**
+     * Stop live bounty timer
+     */
+    stopLiveBountyTimer() {
+        if (this.liveBountyInterval) {
+            clearInterval(this.liveBountyInterval);
+            this.liveBountyInterval = null;
+        }
+        if (this.elements.liveBounty) {
+            this.elements.liveBounty.style.display = 'none';
         }
     }
 

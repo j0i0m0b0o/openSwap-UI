@@ -860,13 +860,13 @@ async function updateSwapDetails() {
                 const settlerRewardEth = Number(settlerRewardWei) / 1e18;
                 elements.settlerRewardInput.placeholder = settlerRewardEth.toFixed(9);
 
-                // Calculate initial liquidity: max(10% of sellAmt, gasCost / 0.01%)
-                // 0.01% constraint means: gasCost <= 0.0001 * initLiq, so minInitLiq = gasCost / 0.0001 = gasCost * 10000
+                // Calculate initial liquidity: max(10% of sellAmt, gasCost / 0.008%)
+                // 0.008% constraint means: gasCost <= 0.00008 * initLiq, so minInitLiq = gasCost / 0.00008 = gasCost * 12500
                 const sellAmt = parseFloat(state.sellAmount);
                 let initLiqValue, initLiqUsd;
 
                 if (state.sellToken.symbol === 'ETH') {
-                    const minInitLiqWei = gasCostWei * BigInt(10000);  // gasCost / 0.01%
+                    const minInitLiqWei = gasCostWei * BigInt(12500);  // gasCost / 0.008%
                     const tenPercentSellWei = BigInt(Math.floor(sellAmt * 1e18)) * BigInt(10) / BigInt(100);
                     const initLiqWei = tenPercentSellWei > minInitLiqWei ? tenPercentSellWei : minInitLiqWei;
                     initLiqValue = Number(initLiqWei) / 1e18;
@@ -876,7 +876,7 @@ async function updateSwapDetails() {
                 } else {
                     const gasCostEth = Number(gasCostWei) / 1e18;
                     const gasCostUsd = gasCostEth * state.currentPrice;
-                    const minInitLiqUsd = gasCostUsd * 10000;  // gasCost / 0.01%
+                    const minInitLiqUsd = gasCostUsd * 12500;  // gasCost / 0.008%
                     const tenPercentSellUsd = sellAmt * 0.10;
                     initLiqUsd = tenPercentSellUsd > minInitLiqUsd ? tenPercentSellUsd : minInitLiqUsd;
                     elements.initialLiquidityInput.placeholder = initLiqUsd.toFixed(2);
@@ -1231,13 +1231,13 @@ async function handleSwap() {
         const tenPercentSell = sellAmountWei * BigInt(10) / BigInt(100);
         let minInitLiq;
         if (state.sellToken.address === ethers.ZeroAddress) {
-            // Selling ETH: minInitLiq = gasCost / 0.0001 = gasCost * 10000
-            minInitLiq = gasCostWei * BigInt(10000);
+            // Selling ETH: minInitLiq = gasCost / 0.00008 = gasCost * 12500
+            minInitLiq = gasCostWei * BigInt(12500);
         } else {
             // Selling USDC: convert gas cost to USD then to USDC units
             const gasCostEth = parseFloat(ethers.formatEther(gasCostWei));
             const gasCostUsd = gasCostEth * state.currentPrice;
-            const minInitLiqUsd = gasCostUsd * 10000;  // gasCost / 0.01%
+            const minInitLiqUsd = gasCostUsd * 12500;  // gasCost / 0.008%
             minInitLiq = BigInt(Math.ceil(minInitLiqUsd * 1e6));
         }
 
@@ -1403,7 +1403,10 @@ async function handleSwap() {
                 buyToken: state.buyToken.symbol,
                 minReceived: minOutFormatted,
                 gasCompensation: swapParams.gasCompensation,
-                bountyToken: swapParams.bountyParams.bountyToken
+                bountyParams: {
+                    ...swapParams.bountyParams,
+                    ethPrice: state.currentPrice
+                }
             });
 
             // Scroll to status tracker
