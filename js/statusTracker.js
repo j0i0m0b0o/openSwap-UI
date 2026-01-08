@@ -164,6 +164,7 @@ class StatusTracker {
             initialReporter: document.getElementById('initialReporter'),
             initialAmount1: document.getElementById('initialAmount1'),
             initialAmount2: document.getElementById('initialAmount2'),
+            initialBountyClaimed: document.getElementById('initialBountyClaimed'),
 
             // Dispute details
             disputeCount: document.getElementById('disputeCount'),
@@ -942,6 +943,22 @@ class StatusTracker {
                 this.elements.initialReporter.textContent = shortenAddress(reporter);
                 this.elements.initialAmount1.textContent = amount1Label;
                 this.elements.initialAmount2.textContent = amount2Label;
+
+                // Display bounty claimed in USD (2 sig figs)
+                if (this.bountyPaid !== null && this.elements.initialBountyClaimed) {
+                    const isEthBounty = !this.bountyToken ||
+                        this.bountyToken === '0x0000000000000000000000000000000000000000';
+                    let bountyUsd;
+                    if (isEthBounty) {
+                        const bountyEth = Number(this.bountyPaid) / 1e18;
+                        const ethPrice = this.bountyParams?.ethPrice || price; // use oracle price as fallback
+                        bountyUsd = bountyEth * ethPrice;
+                    } else {
+                        bountyUsd = Number(this.bountyPaid) / 1e6; // USDC
+                    }
+                    const formatted = bountyUsd >= 1 ? `$${bountyUsd.toFixed(2)}` : `$${bountyUsd.toPrecision(2)}`;
+                    this.elements.initialBountyClaimed.textContent = formatted;
+                }
                 this.elements.stepInitialReportDetails.style.display = 'block';
 
                 // Start settle timer
