@@ -154,6 +154,8 @@ contract openSwap is ReentrancyGuard {
         if (sellAmt == 0 || minOut == 0 || minFulfillLiquidity == 0) revert InvalidInput("zero amounts");
         if (fulfillFeeParams.maxFee >= 1e7) revert InvalidInput("fulfillmentFee");
 
+        if (slippageParams.priceTolerated == 0 || slippageParams.toleranceRange == 0 || slippageParams.toleranceRange > 1e7) revert InvalidInput("slippage");
+
         if (oracleParams.settlerReward < 100
             || oracleParams.swapFee == 0 
             || oracleParams.settlementTime == 0 
@@ -569,22 +571,18 @@ contract openSwap is ReentrancyGuard {
         
         return currentFee;
     }
-    
-    // can maybe make this log-symmetric but just keep it simple for now
-    // balances incentives in the swapping game so the swapper puts the current price in priceTolerated if they want a matcher to come.
+
     function toleranceCheck(uint256 price, uint256 priceTolerated, uint24 toleranceRange)
         internal
         pure
         returns (bool)
     {
-        if (priceTolerated == 0 || toleranceRange == 0) return true;
-        uint256 maxDiff = (priceTolerated * toleranceRange) / 1e7;
+        uint256 tr = uint256(toleranceRange);
+        uint256 upper = (priceTolerated * (1e7 + tr)) / 1e7;
+        uint256 lower = (priceTolerated * 1e7) / (1e7 + tr);
 
-        if (priceTolerated > price) {
-            return (priceTolerated - price) <= maxDiff;
-        } else {
-            return (price - priceTolerated) <= maxDiff;
-        }
+        return price >= lower && price <= upper;
+
     }
 
     function impliedBlocksPerSecond(bool timeType, uint48 _time, uint48 _timeOppo, uint48 blocksPerSecond) internal view returns (bool) {
@@ -605,7 +603,7 @@ contract openSwap is ReentrancyGuard {
 
         if (
             1000 * _timeChangeBlock > expectedBlocks + 2 * _blocksPerSecond
-                || 1000 * _timeChangeBlock < expectedBlocks - 2 * _blocksPerSecond
+                || 1000 * _timeChangeBlock + 2 * _blocksPerSecond < expectedBlocks
         ) {
             return false;
         } else {
