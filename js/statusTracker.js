@@ -493,7 +493,7 @@ class StatusTracker {
                 return;
             }
 
-            // Get current block
+            // Get current block first to calculate fromBlock
             const currentBlock = await this.rpcCall('eth_blockNumber');
             const currentBlockNum = parseInt(currentBlock, 16);
 
@@ -507,30 +507,38 @@ class StatusTracker {
                 return;
             }
 
-            // Query logs from openSwap contract
-            await this.queryContractLogs(
-                CONFIG.contracts.openSwap,
-                fromBlock,
-                currentBlockNum,
-                this.handleOpenSwapEvent.bind(this)
-            );
+            const fromBlockHex = '0x' + fromBlock.toString(16);
+            const toBlockHex = '0x' + currentBlockNum.toString(16);
 
-            // Query logs from openOracle contract
-            await this.queryContractLogs(
-                CONFIG.contracts.openOracle,
-                fromBlock,
-                currentBlockNum,
-                this.handleOracleEvent.bind(this)
-            );
+            // Batch all getLogs calls into one request
+            const hasBountyContract = CONFIG.contracts.oracleBounty &&
+                CONFIG.contracts.oracleBounty !== '0x0000000000000000000000000000000000000000';
 
-            // Query logs from oracleBounty contract (if configured)
-            if (CONFIG.contracts.oracleBounty && CONFIG.contracts.oracleBounty !== '0x0000000000000000000000000000000000000000') {
-                await this.queryContractLogs(
-                    CONFIG.contracts.oracleBounty,
-                    fromBlock,
-                    currentBlockNum,
-                    this.handleBountyEvent.bind(this)
-                );
+            const batchCalls = [
+                { method: 'eth_getLogs', params: [{ address: CONFIG.contracts.openSwap, fromBlock: fromBlockHex, toBlock: toBlockHex }] },
+                { method: 'eth_getLogs', params: [{ address: CONFIG.contracts.openOracle, fromBlock: fromBlockHex, toBlock: toBlockHex }] }
+            ];
+            if (hasBountyContract) {
+                batchCalls.push({ method: 'eth_getLogs', params: [{ address: CONFIG.contracts.oracleBounty, fromBlock: fromBlockHex, toBlock: toBlockHex }] });
+            }
+
+            const [openSwapLogs, oracleLogs, bountyLogs] = await this.rpcCallBatch(batchCalls);
+
+            // Process logs in order
+            if (openSwapLogs && openSwapLogs.length > 0) {
+                for (const log of openSwapLogs) {
+                    await this.handleOpenSwapEvent(log);
+                }
+            }
+            if (oracleLogs && oracleLogs.length > 0) {
+                for (const log of oracleLogs) {
+                    await this.handleOracleEvent(log);
+                }
+            }
+            if (hasBountyContract && bountyLogs && bountyLogs.length > 0) {
+                for (const log of bountyLogs) {
+                    await this.handleBountyEvent(log);
+                }
             }
 
             this.lastBlockChecked = currentBlockNum;
@@ -1373,6 +1381,36 @@ class StatusTracker {
         const data = await response.json();
         if (data.error) throw new Error(data.error.message);
         return data.result;
+    }
+
+    /**
+     * Make batched RPC calls (multiple calls in one request)
+     * @param {Array} calls - Array of {method, params} objects
+     * @returns {Array} Array of results in same order
+     */
+    async rpcCallBatch(calls) {
+        const batch = calls.map((call, i) => ({
+            jsonrpc: '2.0',
+            method: call.method,
+            params: call.params || [],
+            id: i
+        }));
+
+        const response = await fetch(CONFIG.rpcUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(batch)
+        });
+
+        const results = await response.json();
+
+        // Sort by id to ensure correct order
+        results.sort((a, b) => a.id - b.id);
+
+        return results.map(r => {
+            if (r.error) throw new Error(r.error.message);
+            return r.result;
+        });
     }
 
     /**

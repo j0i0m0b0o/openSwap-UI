@@ -8,6 +8,7 @@ import { wallet } from './wallet.js';
 import { openSwap } from './contract.js';
 import { ETH, USDC, getToken, formatTokenAmount, parseTokenAmount } from './tokens.js';
 import { priceFeed } from './price.js';
+import { priceValidator } from './priceValidator.js';
 import { volatility } from './volatility.js';
 import { gasOracle } from './gasOracle.js';
 import { statusTracker } from './statusTracker.js';
@@ -34,6 +35,7 @@ const state = {
     currentView: 'swap',
     userOrders: [],
     currentPrice: null,
+    priceSourcesValid: true, // False when price sources disagree
     isRecalculating: false, // True when recalculating slippage/bounty
     pendingRecalcId: 0, // Increments on user-triggered recalc, used to ignore stale callbacks
     activeRecalcId: 0, // The recalc ID that's currently being processed
@@ -284,6 +286,21 @@ function setupPriceFeed() {
 
     // Connect to price feed
     priceFeed.connect();
+
+    // Start price validator (validates Coinbase against other sources)
+    priceValidator.on(({ event, reason, deviations }) => {
+        const wasValid = state.priceSourcesValid;
+        state.priceSourcesValid = (event === 'valid');
+
+        if (wasValid !== state.priceSourcesValid) {
+            updatePriceDisplay();
+            updateSwapButtonState();
+            if (!state.priceSourcesValid) {
+                console.warn('[PriceValidator] Price sources disagree:', reason, deviations);
+            }
+        }
+    });
+    priceValidator.start();
 }
 
 /**
@@ -330,7 +347,13 @@ function updatePriceDisplay() {
 
     // Always show ETH price in USD
     if (elements.swapRate) {
-        elements.swapRate.textContent = `1 ETH = $${priceFormatted}`;
+        if (!state.priceSourcesValid) {
+            elements.swapRate.textContent = 'Price sources disagree';
+            elements.swapRate.style.color = 'var(--error)';
+        } else {
+            elements.swapRate.textContent = `1 ETH = $${priceFormatted}`;
+            elements.swapRate.style.color = '';
+        }
     }
 
     // Update USD values
@@ -352,6 +375,22 @@ function updateUsdValues() {
     } else {
         elements.sellUsdValue.textContent = formatUSD(sellAmt);
         elements.buyUsdValue.textContent = formatUSD(buyAmt * state.currentPrice);
+    }
+}
+
+/**
+ * Update swap button state based on price validation
+ */
+function updateSwapButtonState() {
+    const btn = elements.swapBtn;
+    if (!btn) return;
+
+    if (!state.priceSourcesValid) {
+        btn.disabled = true;
+        btn.classList.add('price-invalid');
+    } else {
+        btn.disabled = false;
+        btn.classList.remove('price-invalid');
     }
 }
 
@@ -1210,20 +1249,6 @@ async function handleSwap() {
         // Calculate price tolerated (using 1e18 precision to match oracle)
         const priceTolerated = (sellAmountWei * BigInt(10 ** 18)) / buyAmountWei;
 
-        // Preflight checks - these should never be zero
-        if (priceTolerated === BigInt(0)) {
-            showToast('Invalid Parameters', 'priceTolerated cannot be zero', 'error');
-            return;
-        }
-        if (toleranceRange === 0) {
-            showToast('Invalid Parameters', 'toleranceRange cannot be zero - check slippage', 'error');
-            return;
-        }
-        if (volatility.getRecommendedSlippage() === 0) {
-            showToast('Volatility Error', 'Unable to calculate volatility - try again', 'error');
-            return;
-        }
-
         // Initial liquidity: max(10% of sellAmt, dispute gas cost / 0.01%)
         // 0.01% constraint means gas cost should be <= 0.01% of init liq
         // Uses floored gas cost for init liq (clamps baseFee to 0.001 gwei in low gas regime)
@@ -1347,12 +1372,56 @@ async function handleSwap() {
         };
 
         // Preflight checks on swapParams
+        if (BigInt(swapParams.slippageParams.priceTolerated) === BigInt(0)) {
+            showToast('Invalid Parameters', 'priceTolerated cannot be zero', 'error');
+            return;
+        }
+        if (swapParams.slippageParams.toleranceRange === 0) {
+            showToast('Invalid Parameters', 'toleranceRange cannot be zero - check slippage', 'error');
+            return;
+        }
+        if (volatility.getRecommendedSlippage() === 0) {
+            showToast('Volatility Error', 'Unable to calculate volatility - try again', 'error');
+            return;
+        }
         if (swapParams.expirationSeconds > 60) {
             showToast('Invalid Parameters', 'Expiration cannot exceed 60 seconds', 'error');
             return;
         }
         if (swapParams.oracleParams.settlementTime > 60) {
             showToast('Invalid Parameters', 'Settlement time cannot exceed 60 seconds', 'error');
+            return;
+        }
+        if (swapParams.oracleParams.timeType && swapParams.oracleParams.settlementTime < 4) {
+            showToast('Invalid Parameters', 'Settlement time must be at least 4 seconds', 'error');
+            return;
+        }
+        if (!swapParams.oracleParams.timeType && swapParams.oracleParams.settlementTime < 2) {
+            showToast('Invalid Parameters', 'Settlement time must be at least 2 blocks', 'error');
+            return;
+        }
+        if (swapParams.oracleParams.maxGameTime > 1800) {
+            showToast('Invalid Parameters', 'maxGameTime cannot exceed 1800', 'error');
+            return;
+        }
+        if (BigInt(swapParams.oracleParams.settlerReward) > ethers.parseEther('0.01')) {
+            showToast('Invalid Parameters', 'Settler reward cannot exceed 0.01 ETH', 'error');
+            return;
+        }
+        if (swapParams.oracleParams.latencyBailout > 60) {
+            showToast('Invalid Parameters', 'Latency bailout cannot exceed 60 seconds', 'error');
+            return;
+        }
+        if (swapParams.oracleParams.blocksPerSecond !== 500) {
+            showToast('Invalid Parameters', 'blocksPerSecond must be 500', 'error');
+            return;
+        }
+        if (swapParams.oracleParams.swapFee > 10000 || swapParams.oracleParams.protocolFee > 10000) {
+            showToast('Invalid Parameters', 'swapFee and protocolFee cannot exceed 10000', 'error');
+            return;
+        }
+        if (swapParams.oracleParams.multiplier > 300) {
+            showToast('Invalid Parameters', 'multiplier cannot exceed 300', 'error');
             return;
         }
         if (swapParams.fulfillFeeParams.maxFee > 20000) {

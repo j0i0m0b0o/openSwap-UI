@@ -25,7 +25,7 @@ export const NETWORKS = {
         rpcUrl: 'https://mainnet.optimism.io',
         blockExplorer: 'https://optimistic.etherscan.io',
         contracts: {
-            openSwap: '0x75bC29FCf9aa8255B139574Ca66ec216B108573F',
+            openSwap: '0xd3E9288779132fD5fbcf5b2b5476399eC8154caC',
             openOracle: '0xf3CCE3274c32f1F344Ba48336D5EFF34dc6E145f',
             oracleBounty: '0x971F2EE9a8ccDc455fd39403788C75bfd58dA321',
         },
