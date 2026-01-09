@@ -1966,38 +1966,40 @@ async function updateCostBreakdown() {
         } else {
             return;
         }
-        // Expected bounty payout ~80% of vol * initLiq (starts at 50%, grows over time)
+        // Expected bounty payout ~65% of vol * initLiq (starts at 50%, grows over time)
         const minBountyPct = 0.0065 * initLiqRatio; // 0.0065% of initLiq
         const maxBountyPct = 0.2 * initLiqRatio; // 0.2% of initLiq (cap is 2x start, so max payout ~0.4%)
-        let reporterRewardPct = 0.8 * volSettlement * initLiqRatio * 100;
+        let reporterRewardPct = 0.65 * volSettlement * initLiqRatio * 100;
         reporterRewardPct = Math.max(minBountyPct, Math.min(maxBountyPct * 2, reporterRewardPct));
 
-        // 3. Other gas: swap creation gas + gasCompensation
+        // 3. Other gas: swap creation gas + gasCompensation + settlerReward
         if (!gasOracle.isReady()) return;
-        // Swap creation: ~500k gas using MetaMask's suggested gas price
+        // Swap creation: ~550k gas using MetaMask's suggested gas price
         let swapCreationCostEth = 0;
         try {
             const provider = wallet.provider;
             if (provider) {
                 // Use getGasPrice() directly - Optimism doesn't support EIP-1559 priority fees
                 const gasPrice = await provider.getGasPrice();
-                const swapCreationGas = BigInt(500000);
+                const swapCreationGas = BigInt(550000);
                 const swapCreationCostWei = swapCreationGas * gasPrice;
                 swapCreationCostEth = parseFloat(ethers.formatEther(swapCreationCostWei));
             }
         } catch (e) {
             // Fallback to gas oracle if MetaMask unavailable
             const effectiveGasPrice = gasOracle.getEffectiveGasPrice();
-            const swapCreationGas = BigInt(500000);
+            const swapCreationGas = BigInt(550000);
             const swapCreationCostWei = swapCreationGas * effectiveGasPrice;
             swapCreationCostEth = parseFloat(ethers.formatEther(swapCreationCostWei));
         }
         // gasCompensation from gas oracle
         const gasCompWei = gasOracle.getMatchCost();
         const gasCompEth = parseFloat(ethers.formatEther(gasCompWei));
-        // settlerReward from gas oracle
-        const settlerRewardWei = gasOracle.getSettleCost();
-        const settlerRewardEth = parseFloat(ethers.formatEther(settlerRewardWei));
+        // settlerReward: max of gas-based OR 0.001% of notional (same as swap params)
+        const gasBasedSettlerRewardWei = gasOracle.getSettleCost();
+        const gasBasedSettlerRewardEth = parseFloat(ethers.formatEther(gasBasedSettlerRewardWei));
+        const notionalBasedSettlerRewardEth = (swapNotionalUsd * 0.00001) / state.currentPrice;
+        const settlerRewardEth = Math.max(gasBasedSettlerRewardEth, notionalBasedSettlerRewardEth);
         // Total gas cost
         const totalGasEth = swapCreationCostEth + gasCompEth + settlerRewardEth;
         const gasCostUsd = totalGasEth * state.currentPrice;
