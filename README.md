@@ -2,6 +2,10 @@
 
 A web interface for openSwap — an oracle-powered token swap protocol with trust-minimized price discovery through [openOracle](https://openprices.gitbook.io/openoracle-docs).
 
+Contracts and tests can be found in the below repo:
+
+  https://github.com/j0i0m0b0o/openOracleBase/tree/toxicWasteManagement
+
 ## Overview
 
 openSwap enables ETH/USDC swaps using an optimistic oracle mechanism instead of traditional AMM liquidity pools. Prices are determined through a decentralized reporting and dispute game, providing MEV-resistant execution with transparent pricing.
