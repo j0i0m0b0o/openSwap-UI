@@ -58,7 +58,7 @@ const DISPUTE_CALLDATA = '0x' +
 const TIP_PERCENTAGE = 15n;  // 15% tip on baseFee for priority
 const SETTLER_SPREAD = 25n;  // 25% spread on settler reward for safety
 const LOW_GAS_THRESHOLD = 20000n;  // 20k wei - below this is "low gas regime"
-const LOW_GAS_FLOOR_SETTLER = BigInt(1e5);  // 0.0001 gwei = 100,000 wei - floor for settler reward
+const LOW_GAS_FLOOR_SETTLER = BigInt(5e4);  // 0.00005 gwei = 50,000 wei - floor for settler reward
 const LOW_GAS_FLOOR_INIT_LIQ = BigInt(5e5);  // 0.0005 gwei = 500,000 wei - floor for initial liquidity
 
 // Backup RPCs for Optimism (used if primary provider fails)

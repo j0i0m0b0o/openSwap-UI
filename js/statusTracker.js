@@ -188,7 +188,29 @@ class StatusTracker {
             executedFulfillFee: document.getElementById('executedFulfillFee'),
             executedGasCosts: document.getElementById('executedGasCosts'),
             executedTotalExpenses: document.getElementById('executedTotalExpenses'),
+            // Gas breakdown
+            gasBreakdownToggle: document.getElementById('gasBreakdownToggle'),
+            gasBreakdownPanel: document.getElementById('gasBreakdownPanel'),
+            executedSwapTxGas: document.getElementById('executedSwapTxGas'),
+            executedGasComp: document.getElementById('executedGasComp'),
+            executedSettlerReward: document.getElementById('executedSettlerReward'),
         };
+
+        // Setup gas breakdown toggle
+        if (this.elements.gasBreakdownToggle && this.elements.gasBreakdownPanel) {
+            this.elements.gasBreakdownToggle.style.cursor = 'pointer';
+            this.elements.gasBreakdownToggle.onclick = () => {
+                const panel = this.elements.gasBreakdownPanel;
+                const toggle = this.elements.gasBreakdownToggle;
+                if (panel.style.display === 'none') {
+                    panel.style.display = 'block';
+                    toggle.classList.add('open');
+                } else {
+                    panel.style.display = 'none';
+                    toggle.classList.remove('open');
+                }
+            };
+        }
     }
 
     /**
@@ -220,6 +242,7 @@ class StatusTracker {
         this.bountyToken = this.bountyParams?.bountyToken || null;
         this.fulfillmentFee = null;
         this.gasCompensation = orderInfo?.gasCompensation || null;
+        this.settlerReward = orderInfo?.settlerReward || null;
 
         // Reset live bounty state
         this.stopLiveBountyTimer();
@@ -1178,6 +1201,25 @@ class StatusTracker {
                 ethPrice = parseFloat(priceStr) || 0;
             }
 
+            // Calculate swap notional in USD for percentage display
+            let swapNotionalUsd = 0;
+            if (sellTokenAmt) {
+                if (isReceivingEth) {
+                    // Selling USDC (6 decimals)
+                    swapNotionalUsd = Number(sellTokenAmt) / 1e6;
+                } else {
+                    // Selling ETH (18 decimals)
+                    swapNotionalUsd = (Number(sellTokenAmt) / 1e18) * ethPrice;
+                }
+            }
+
+            // Format percentage for display
+            const formatPct = (usdValue) => {
+                if (swapNotionalUsd <= 0) return '';
+                const pct = (usdValue / swapNotionalUsd) * 100;
+                return ` (${pct.toFixed(3)}%)`;
+            };
+
             let totalExpensesUsd = 0;
 
             // 1. Net Bounty Cost (actual bounty paid from BountyInitialReportSubmitted)
@@ -1199,7 +1241,7 @@ class StatusTracker {
             }
 
             if (this.elements.executedBountyCost) {
-                this.elements.executedBountyCost.textContent = formatUsd(netBountyCostUsd);
+                this.elements.executedBountyCost.textContent = formatUsd(netBountyCostUsd) + formatPct(netBountyCostUsd);
             }
             totalExpensesUsd += netBountyCostUsd;
 
@@ -1221,14 +1263,15 @@ class StatusTracker {
             }
 
             if (this.elements.executedFulfillFee) {
-                this.elements.executedFulfillFee.textContent = formatUsd(fulfillFeeUsd);
+                this.elements.executedFulfillFee.textContent = formatUsd(fulfillFeeUsd) + formatPct(fulfillFeeUsd);
             }
             totalExpensesUsd += fulfillFeeUsd;
 
-            // 3. Gas Costs (swap tx gas + gasCompensation)
+            // 3. Gas Costs (swap tx gas + gasCompensation + settlerReward)
             let gasCostsUsd = 0;
             let swapTxGasUsd = 0;
             let gasCompUsd = 0;
+            let settlerRewardUsd = 0;
 
             // Get gas used from swap tx receipt
             if (this.swapTxHash) {
@@ -1258,16 +1301,33 @@ class StatusTracker {
                 console.log(`[StatusTracker] Gas compensation: ${gasCompEth} ETH = $${gasCompUsd.toFixed(6)}`);
             }
 
-            gasCostsUsd = swapTxGasUsd + gasCompUsd;
+            // Add settlerReward (in wei string)
+            if (this.settlerReward) {
+                const settlerRewardEth = Number(this.settlerReward) / 1e18;
+                settlerRewardUsd = settlerRewardEth * ethPrice;
+                console.log(`[StatusTracker] Settler reward: ${settlerRewardEth} ETH = $${settlerRewardUsd.toFixed(6)}`);
+            }
+
+            gasCostsUsd = swapTxGasUsd + gasCompUsd + settlerRewardUsd;
 
             if (this.elements.executedGasCosts) {
-                this.elements.executedGasCosts.textContent = formatUsd(gasCostsUsd);
+                this.elements.executedGasCosts.textContent = formatUsd(gasCostsUsd) + formatPct(gasCostsUsd);
+            }
+            // Display breakdown values
+            if (this.elements.executedSwapTxGas) {
+                this.elements.executedSwapTxGas.textContent = formatUsd(swapTxGasUsd);
+            }
+            if (this.elements.executedGasComp) {
+                this.elements.executedGasComp.textContent = formatUsd(gasCompUsd);
+            }
+            if (this.elements.executedSettlerReward) {
+                this.elements.executedSettlerReward.textContent = formatUsd(settlerRewardUsd);
             }
             totalExpensesUsd += gasCostsUsd;
 
             // 4. Total Expenses
             if (this.elements.executedTotalExpenses) {
-                this.elements.executedTotalExpenses.textContent = formatUsd(totalExpensesUsd);
+                this.elements.executedTotalExpenses.textContent = formatUsd(totalExpensesUsd) + formatPct(totalExpensesUsd);
             }
 
             console.log(`[StatusTracker] Expenses: bounty=${formatUsd(netBountyCostUsd)}, fee=${formatUsd(fulfillFeeUsd)}, gas=${formatUsd(gasCostsUsd)}, total=${formatUsd(totalExpensesUsd)}`);

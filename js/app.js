@@ -42,11 +42,33 @@ const state = {
     ordersRefreshInterval: null, // Interval for refreshing orders view (contract data)
     countdownInterval: null, // Interval for updating countdown displays every second
     matchedSwapIds: new Map(), // Track optimistically matched swaps: swapId -> bailoutDeadline
+    needsSellAmountUpdate: false, // True when manual initLiq causes sellAmt + bounty > balance
+    estTotalCostPct: null, // Estimated total cost as percentage of swap notional
     settings: {
         slippage: 0.2,
         deadline: 60
     }
 };
+
+// Delay Mode helpers (stored per address+network in localStorage)
+function getDelayModeKey() {
+    const address = wallet.address;
+    const chainId = CONFIG.chainId;
+    if (!address) return null;
+    return `delayMode_${address.toLowerCase()}_${chainId}`;
+}
+
+function loadDelayMode() {
+    const key = getDelayModeKey();
+    if (!key) return false;
+    return localStorage.getItem(key) === 'true';
+}
+
+function saveDelayMode(enabled) {
+    const key = getDelayModeKey();
+    if (!key) return;
+    localStorage.setItem(key, enabled ? 'true' : 'false');
+}
 
 // DOM Elements
 let elements = {};
@@ -66,28 +88,28 @@ async function init() {
     // Auto-connect if previously authorized
     tryAutoConnect();
 
-    // Refresh balances every 5 seconds
+    // Refresh balances every 5 seconds (use 'pending' to avoid stale cache)
     setInterval(() => {
         if (wallet.isConnected()) {
-            updateBalances();
+            updateBalances('pending');
         }
     }, 5000);
 
     // Refresh balances when swap is executed (with retry for RPC staleness)
     statusTracker.onExecuted(() => {
-        console.log('[App] Swap executed, refreshing balances...');
-        updateBalances();
+        console.log('[App] Swap executed, refreshing balances with pending blockTag...');
+        updateBalances('pending');
         // RPC may be stale, retry with increasing delays
-        setTimeout(() => updateBalances(), 2000);
-        setTimeout(() => updateBalances(), 5000);
-        setTimeout(() => updateBalances(), 10000);
+        setTimeout(() => updateBalances('pending'), 2000);
+        setTimeout(() => updateBalances('pending'), 5000);
+        setTimeout(() => updateBalances('latest'), 10000);
     });
 
     // Refresh balances when swap is cancelled
     statusTracker.onCancelled(() => {
         console.log('[App] Swap cancelled, refreshing balances...');
-        updateBalances();
-        setTimeout(() => updateBalances(), 1000);
+        updateBalances('pending');
+        setTimeout(() => updateBalances('pending'), 1000);
     });
 
     // Refresh orders when swap is matched
@@ -139,7 +161,7 @@ function setupVisibilityHandler() {
             // Refresh gas if wallet connected
             if (wallet.isConnected() && wallet.provider) {
                 refreshPromises.push(gasOracle.update(wallet.provider, true));
-                refreshPromises.push(updateBalances());
+                refreshPromises.push(updateBalances('pending'));
             }
 
             await Promise.all(refreshPromises);
@@ -201,6 +223,8 @@ function cacheElements() {
         buyTokenIcon: document.getElementById('buyTokenIcon'),
         sellBalance: document.getElementById('sellBalance'),
         buyBalance: document.getElementById('buyBalance'),
+        halfBtn: document.getElementById('halfBtn'),
+        maxBtn: document.getElementById('maxBtn'),
         sellUsdValue: document.getElementById('sellUsdValue'),
         buyUsdValue: document.getElementById('buyUsdValue'),
         swapDirectionBtn: document.getElementById('swapDirectionBtn'),
@@ -216,6 +240,7 @@ function cacheElements() {
         initialLiquidityInput: document.getElementById('initialLiquidityInput'),
         maxBountyInput: document.getElementById('maxBountyInput'),
         maxBountyLabel: document.getElementById('maxBountyLabel'),
+        delayModeToggle: document.getElementById('delayModeToggle'),
         slippageInput: document.getElementById('slippageInput'),
 
         // Gas debug
@@ -316,6 +341,9 @@ function setupVolatilityTracker() {
             console.log(`Auto-slippage updated: ${recommended.toFixed(3)}%`);
         }
 
+        // Recalculate bounty (volatility affects bounty calculation)
+        updateSwapDetails();
+
         // Update cost breakdown (IQR affects reporter reward estimate)
         updateCostBreakdown();
 
@@ -325,8 +353,9 @@ function setupVolatilityTracker() {
             state.isRecalculating = false;
             state.pendingRecalcId = 0;
             state.activeRecalcId = 0;
-            updateSwapButton();
         }
+        // Always update swap button to check balance against new bounty
+        updateSwapButton();
     });
 
     // Initialize with current settlement time from input
@@ -412,7 +441,7 @@ function autoCalculateBuyAmount() {
         buyAmt = sellAmt / state.currentPrice;
     }
 
-    state.buyAmount = buyAmt.toFixed(state.buyToken.symbol === 'USDC' ? 2 : 6);
+    state.buyAmount = buyAmt.toFixed(state.buyToken.symbol === 'USDC' ? 2 : 12);
     elements.buyAmount.value = state.buyAmount;
 
     updateSwapDetails();
@@ -504,10 +533,26 @@ function setupEventListeners() {
         }
     });
 
-    // Initial liquidity change - recalculate bounty and cost breakdown
+    // Initial liquidity change - recalculate bounty, cost breakdown, and check balance
     elements.initialLiquidityInput.addEventListener('input', () => {
         recalculateBounty();
         updateCostBreakdown();
+        updateSwapButton();
+    });
+
+    // Settler reward change - check balance (ETH sells only)
+    elements.settlerRewardInput.addEventListener('input', () => {
+        updateSwapButton();
+    });
+
+    // Max bounty change - check balance
+    elements.maxBountyInput.addEventListener('input', () => {
+        updateSwapButton();
+    });
+
+    // Delay mode toggle - save to localStorage
+    elements.delayModeToggle.addEventListener('change', () => {
+        saveDelayMode(elements.delayModeToggle.checked);
     });
 
     // Close modals on overlay click
@@ -524,95 +569,148 @@ function setupEventListeners() {
         input.addEventListener('input', () => validateNumericInput(input));
     });
 
-    // Max button for sell balance
-    elements.sellBalance.parentElement.addEventListener('click', async () => {
-        if (!wallet.isConnected()) return;
+    // Helper function to calculate max sellable amount (uses cached balance)
+    function calculateMaxSellable() {
+        if (!wallet.isConnected()) return null;
 
-        try {
-            // Get raw balance from chain (avoids rounding issues from displayed text)
-            const rawBalance = await wallet.getTokenBalance(state.sellToken.address);
-            if (!rawBalance || rawBalance === BigInt(0)) return;
+        const rawBalance = state.sellToken.rawBalance;
+        if (!rawBalance || rawBalance === BigInt(0)) return null;
 
-            const decimals = state.sellToken.decimals;
-            let maxAmount;
+        // If selling ETH, reserve some for gasComp, bounty, settlerReward, and gas buffer
+        if (state.sellToken.address === ethers.ZeroAddress && state.currentPrice > 0) {
+            const balanceEth = parseFloat(ethers.formatEther(rawBalance));
 
-            // If selling ETH, reserve some for gasComp, bounty, settlerReward, and gas buffer
-            if (state.sellToken.address === ethers.ZeroAddress && state.currentPrice > 0) {
-                const balanceEth = parseFloat(ethers.formatEther(rawBalance));
+            // Calculate overhead costs in ETH (gas oracle uses its own effective gas price)
+            const gasCompEth = gasOracle.isReady()
+                ? parseFloat(ethers.formatEther(gasOracle.getMatchCost()))
+                : 0.001; // fallback
+            const settlerRewardEth = gasOracle.isReady()
+                ? parseFloat(ethers.formatEther(gasOracle.getSettleCost()))
+                : 0.001; // fallback
 
-                // Calculate overhead costs in ETH (gas oracle uses its own effective gas price)
-                const gasCompEth = gasOracle.isReady()
-                    ? parseFloat(ethers.formatEther(gasOracle.getMatchCost()))
-                    : 0.001; // fallback
-                const settlerRewardEth = gasOracle.isReady()
-                    ? parseFloat(ethers.formatEther(gasOracle.getSettleCost()))
-                    : 0.001; // fallback
+            // Estimate bounty: ~0.1% of initialLiquidity (~10% of sellAmt) = ~0.01% of sellAmt
+            const estimatedBountyEth = balanceEth * 0.0001; // 0.01%
 
-                // Estimate bounty: ~0.1% of initialLiquidity (~10% of sellAmt) = ~0.01% of sellAmt
-                const estimatedBountyEth = balanceEth * 0.0001; // 0.01%
+            // Gas buffer: 25 cents worth of ETH
+            const gasBufferEth = 0.25 / state.currentPrice;
 
-                // Gas buffer: 25 cents worth of ETH
-                const gasBufferEth = 0.25 / state.currentPrice;
+            // Total overhead
+            const overheadEth = gasCompEth + settlerRewardEth + estimatedBountyEth + gasBufferEth + 0.000001;
 
-                // Total overhead
-                const overheadEth = gasCompEth + settlerRewardEth + estimatedBountyEth + gasBufferEth + 0.000001;
+            // Max sellable amount
+            const maxSellable = balanceEth - overheadEth;
+            return maxSellable > 0 ? maxSellable : null;
+        } else {
+            // For USDC, reserve exact amount for bounty (bounty is paid in USDC when selling USDC)
+            const balanceUsdc = parseFloat(rawBalance.toString()) / 1e6;
 
-                // Max sellable amount
-                const maxSellable = balanceEth - overheadEth;
-                if (maxSellable > 0) {
-                    maxAmount = maxSellable.toFixed(6);
-                } else {
-                    showToast('Insufficient Balance', 'Not enough ETH to cover swap overhead costs', 'error');
-                    return;
-                }
+            // Calculate gas-floor minInitLiq (same as createSwap)
+            const gasCostWei = gasOracle.getDisputeCostForInitLiq();
+            const gasCostEth = parseFloat(ethers.formatEther(gasCostWei));
+            const gasCostUsd = gasCostEth * state.currentPrice;
+            const minInitLiqUsd = gasCostUsd * 12500; // gasCost / 0.008%
+
+            // Get settlement-time volatility
+            const settlementTime = parseInt(elements.settlementTimeInput.value) || CONFIG.defaults.settlementTime;
+            let volSettlement;
+            if (volatility.lastKrakenVol !== null) {
+                volSettlement = volatility.lastKrakenVol / 6.5;
+            } else if (volatility.lastCandleVol !== null) {
+                volSettlement = (volatility.lastCandleVol / 1.5) / Math.sqrt(60 / settlementTime);
             } else {
-                // For USDC, reserve exact amount for bounty (bounty is paid in USDC when selling USDC)
-                // Calculate bounty ratio: bounty = ratio * sellAmt, so sellAmt = balance / (1 + ratio)
-                const balanceUsdc = parseFloat(rawBalance.toString()) / 1e6;
-
-                // Get settlement-time volatility
-                const settlementTime = parseInt(elements.settlementTimeInput.value) || CONFIG.defaults.settlementTime;
-                let volSettlement;
-                if (volatility.lastKrakenVol !== null) {
-                    volSettlement = volatility.lastKrakenVol / 6.5;
-                } else if (volatility.lastCandleVol !== null) {
-                    volSettlement = (volatility.lastCandleVol / 1.5) / Math.sqrt(60 / settlementTime);
-                } else {
-                    volSettlement = 0.001;
-                }
-
-                // Calculate bounty ratio (bounty / sellAmt)
-                // initLiq = 10% of sellAmt, so initLiqRatio = 0.1
-                const initLiqRatio = 0.1;
-                // bountyStart = max(0.5 * vol * initLiq, 0.0065% of initLiq), capped at 0.2% of initLiq
-                const minBountyStartRatio = 0.000065 * initLiqRatio; // 0.0065% of initLiq
-                const maxBountyStartRatio = 0.002 * initLiqRatio; // 0.2% cap
-                const volBountyStartRatio = 0.5 * volSettlement * initLiqRatio;
-                const bountyStartRatio = Math.min(Math.max(volBountyStartRatio, minBountyStartRatio), maxBountyStartRatio);
-                // totalBounty = max(0.15% of initLiq, 2 * bountyStart)
-                const minTotalRatio = 0.0015 * initLiqRatio; // 0.15% of initLiq
-                const bountyRatio = Math.max(minTotalRatio, 2 * bountyStartRatio);
-
-                // sellAmt = balance / (1 + bountyRatio + buffer)
-                // Add 0.01% buffer for volatility changes between max click and swap
-                const buffer = 0.0001;
-                const maxSellable = balanceUsdc / (1 + bountyRatio + buffer);
-
-                if (maxSellable > 0) {
-                    maxAmount = maxSellable.toFixed(6);
-                } else {
-                    showToast('Insufficient Balance', 'Not enough USDC to cover bounty', 'error');
-                    return;
-                }
+                volSettlement = 0.001;
             }
 
-            elements.sellAmount.value = maxAmount;
-            state.sellAmount = elements.sellAmount.value;
-            autoCalculateBuyAmount();
-            updateSwapButton();
+            // Calculate bounty from minInitLiq (fixed cost regardless of sell amount)
+            const minBountyFromGas = minInitLiqUsd * 0.0015; // 0.15% of gas-floor initLiq
 
-            // Scroll to Create Swap button
-            document.getElementById('swapBtn').scrollIntoView({ behavior: 'smooth', block: 'center' });
+            // Calculate bounty ratio for 10%-of-sell case
+            const initLiqRatio = 0.1;
+            const minBountyStartRatio = 0.000065 * initLiqRatio;
+            const maxBountyStartRatio = 0.002 * initLiqRatio;
+            const volBountyStartRatio = 0.5 * volSettlement * initLiqRatio;
+            const bountyStartRatio = Math.min(Math.max(volBountyStartRatio, minBountyStartRatio), maxBountyStartRatio);
+            const bountyRatioFromTenPct = Math.max(0.0015 * initLiqRatio, 2 * bountyStartRatio);
+
+            // Solve for maxSellable considering both cases:
+            const threshold = minInitLiqUsd / 0.1;
+            const buffer = 0.0001; // 0.01% buffer
+
+            let maxSellable;
+            if (balanceUsdc - minBountyFromGas < threshold) {
+                // Gas floor dominates: bounty is fixed
+                maxSellable = balanceUsdc - minBountyFromGas - buffer * balanceUsdc;
+            } else {
+                // 10% of sell dominates: bounty is proportional
+                maxSellable = balanceUsdc / (1 + bountyRatioFromTenPct + buffer);
+            }
+
+            return maxSellable > 0 ? maxSellable : null;
+        }
+    }
+
+    // Helper to set sell amount and update UI
+    function setSellAmount(amount) {
+        const decimals = state.sellToken.address === ethers.ZeroAddress ? 6 : 6;
+        elements.sellAmount.value = amount.toFixed(decimals);
+        state.sellAmount = elements.sellAmount.value;
+        autoCalculateBuyAmount();
+        updateSwapButton();
+        // Scroll so swap card bottom has buffer space below
+        const swapCard = document.querySelector('.swap-card');
+        if (swapCard) {
+            const rect = swapCard.getBoundingClientRect();
+            const buffer = 40; // pixels below the swap pane
+            const targetScroll = window.scrollY + rect.bottom - window.innerHeight + buffer;
+            window.scrollTo({ top: Math.max(0, targetScroll), behavior: 'smooth' });
+        }
+    }
+
+    // MAX button
+    elements.maxBtn.addEventListener('click', () => {
+        try {
+            const maxAmount = calculateMaxSellable();
+            if (maxAmount === null) {
+                if (state.sellToken.address === ethers.ZeroAddress) {
+                    showToast('Insufficient Balance', 'Not enough ETH to cover swap overhead costs', 'error');
+                } else {
+                    showToast('Insufficient Balance', 'Not enough USDC to cover bounty', 'error');
+                }
+                return;
+            }
+            setSellAmount(maxAmount);
+        } catch (e) {
+            console.error('Error setting max balance:', e);
+        }
+    });
+
+    // HALF button
+    elements.halfBtn.addEventListener('click', () => {
+        try {
+            const maxAmount = calculateMaxSellable();
+            if (maxAmount === null) {
+                showToast('Insufficient Balance', 'Balance too low', 'error');
+                return;
+            }
+            setSellAmount(maxAmount / 2);
+        } catch (e) {
+            console.error('Error setting half balance:', e);
+        }
+    });
+
+    // Balance click also triggers MAX
+    elements.sellBalance.parentElement.addEventListener('click', () => {
+        try {
+            const maxAmount = calculateMaxSellable();
+            if (maxAmount === null) {
+                if (state.sellToken.address === ethers.ZeroAddress) {
+                    showToast('Insufficient Balance', 'Not enough ETH to cover swap overhead costs', 'error');
+                } else {
+                    showToast('Insufficient Balance', 'Not enough USDC to cover bounty', 'error');
+                }
+                return;
+            }
+            setSellAmount(maxAmount);
         } catch (e) {
             console.error('Error setting max balance:', e);
         }
@@ -633,9 +731,11 @@ function setupWalletListeners() {
         switch (event) {
             case 'connect':
                 updateConnectButton(address);
-                await updateBalances();
+                await updateBalances('pending');
                 // Update gas oracle L1 fees
                 gasOracle.update(wallet.provider);
+                // Load delay mode setting for this address+network
+                elements.delayModeToggle.checked = loadDelayMode();
                 if (state.currentView === 'orders') {
                     loadUserOrders();
                 }
@@ -649,7 +749,9 @@ function setupWalletListeners() {
 
             case 'accountsChanged':
                 updateConnectButton(address);
-                await updateBalances();
+                await updateBalances('pending');
+                // Load delay mode setting for new address
+                elements.delayModeToggle.checked = loadDelayMode();
                 showToast('Account Changed', `Now using: ${shortenAddress(address)}`, 'info');
                 break;
 
@@ -692,7 +794,7 @@ async function handleNetworkChange(networkKey) {
     if (wallet.isConnected()) {
         try {
             await wallet.switchNetwork(CONFIG.chainId);
-            await updateBalances();
+            await updateBalances('pending');
         } catch (error) {
             showToast('Network Error', 'Failed to switch network', 'error');
         }
@@ -823,10 +925,19 @@ function swapTokens() {
     state.sellAmount = state.buyAmount;
     state.buyAmount = tempAmount;
 
-    // Swap displayed balances immediately (before async fetch)
-    const tempBalance = elements.sellBalance.textContent;
-    elements.sellBalance.textContent = elements.buyBalance.textContent;
-    elements.buyBalance.textContent = tempBalance;
+    // Reset cost estimate (needs recalculation for new direction)
+    state.estTotalCostPct = null;
+
+    // Use state balances if available (updated with pending blockTag), otherwise swap DOM values
+    if (state.sellToken.balance && state.buyToken.balance) {
+        elements.sellBalance.textContent = state.sellToken.balance;
+        elements.buyBalance.textContent = state.buyToken.balance;
+    } else {
+        // Fallback: swap displayed balances immediately (before async fetch)
+        const tempBalance = elements.sellBalance.textContent;
+        elements.sellBalance.textContent = elements.buyBalance.textContent;
+        elements.buyBalance.textContent = tempBalance;
+    }
 
     updateTokenDisplay('sell', state.sellToken);
     updateTokenDisplay('buy', state.buyToken);
@@ -834,7 +945,7 @@ function swapTokens() {
     elements.sellAmount.value = state.sellAmount;
     elements.buyAmount.value = state.buyAmount;
 
-    updateBalances();
+    updateBalances('pending');
     updatePriceDisplay();
     updateUsdValues();
     updateSwapButton();
@@ -845,6 +956,7 @@ function swapTokens() {
  */
 function handleSellAmountChange() {
     state.sellAmount = elements.sellAmount.value;
+    state.estTotalCostPct = null; // Reset until recalculated
     if (!state.sellAmount || parseFloat(state.sellAmount) === 0) {
         state.buyAmount = '';
         elements.buyAmount.value = '';
@@ -904,22 +1016,35 @@ async function updateSwapDetails() {
                 const sellAmt = parseFloat(state.sellAmount);
                 let initLiqValue, initLiqUsd;
 
+                // Check if user has manually entered initLiq
+                const manualInitLiq = elements.initialLiquidityInput.value;
+                const hasManualInitLiq = manualInitLiq && manualInitLiq !== '' && manualInitLiq !== 'auto';
+
                 if (state.sellToken.symbol === 'ETH') {
-                    const minInitLiqWei = gasCostWei * BigInt(12500);  // gasCost / 0.008%
-                    const tenPercentSellWei = BigInt(Math.floor(sellAmt * 1e18)) * BigInt(10) / BigInt(100);
-                    const initLiqWei = tenPercentSellWei > minInitLiqWei ? tenPercentSellWei : minInitLiqWei;
-                    initLiqValue = Number(initLiqWei) / 1e18;
-                    initLiqUsd = initLiqValue * state.currentPrice;
-                    elements.initialLiquidityInput.placeholder = initLiqValue.toFixed(6);
-                    document.getElementById('initialLiquidityLabel').textContent = 'Initial Liquidity (WETH)';
+                    if (hasManualInitLiq) {
+                        initLiqValue = parseFloat(manualInitLiq);
+                        initLiqUsd = initLiqValue * state.currentPrice;
+                    } else {
+                        const minInitLiqWei = gasCostWei * BigInt(12500);  // gasCost / 0.008%
+                        const tenPercentSellWei = BigInt(Math.floor(sellAmt * 1e18)) * BigInt(10) / BigInt(100);
+                        const initLiqWei = tenPercentSellWei > minInitLiqWei ? tenPercentSellWei : minInitLiqWei;
+                        initLiqValue = Number(initLiqWei) / 1e18;
+                        initLiqUsd = initLiqValue * state.currentPrice;
+                        elements.initialLiquidityInput.placeholder = initLiqValue.toFixed(6);
+                    }
+                    document.getElementById('initialLiquidityLabel').querySelector('span').textContent = 'Initial Liquidity (WETH)';
                 } else {
-                    const gasCostEth = Number(gasCostWei) / 1e18;
-                    const gasCostUsd = gasCostEth * state.currentPrice;
-                    const minInitLiqUsd = gasCostUsd * 12500;  // gasCost / 0.008%
-                    const tenPercentSellUsd = sellAmt * 0.10;
-                    initLiqUsd = tenPercentSellUsd > minInitLiqUsd ? tenPercentSellUsd : minInitLiqUsd;
-                    elements.initialLiquidityInput.placeholder = initLiqUsd.toFixed(2);
-                    document.getElementById('initialLiquidityLabel').textContent = 'Initial Liquidity (USDC)';
+                    if (hasManualInitLiq) {
+                        initLiqUsd = parseFloat(manualInitLiq);
+                    } else {
+                        const gasCostEth = Number(gasCostWei) / 1e18;
+                        const gasCostUsd = gasCostEth * state.currentPrice;
+                        const minInitLiqUsd = gasCostUsd * 12500;  // gasCost / 0.008%
+                        const tenPercentSellUsd = sellAmt * 0.10;
+                        initLiqUsd = tenPercentSellUsd > minInitLiqUsd ? tenPercentSellUsd : minInitLiqUsd;
+                        elements.initialLiquidityInput.placeholder = initLiqUsd.toFixed(2);
+                    }
+                    document.getElementById('initialLiquidityLabel').querySelector('span').textContent = 'Initial Liquidity (USDC)';
                 }
 
                 // Calculate bounty based on settlement-time volatility
@@ -948,12 +1073,12 @@ async function updateSwapDetails() {
                 if (state.sellToken.address !== ethers.ZeroAddress) {
                     document.getElementById('oracleBounty').textContent = `${totalBountyUsd.toFixed(6)} USDC`;
                     elements.maxBountyInput.value = totalBountyUsd.toFixed(6);
-                    elements.maxBountyLabel.textContent = 'Max Bounty (USDC)';
+                    elements.maxBountyLabel.querySelector('span').textContent = 'Max Bounty (USDC)';
                 } else {
                     const totalBountyEth = totalBountyUsd / state.currentPrice;
                     document.getElementById('oracleBounty').textContent = `${totalBountyEth.toFixed(9)} ETH`;
                     elements.maxBountyInput.value = totalBountyEth.toFixed(9);
-                    elements.maxBountyLabel.textContent = 'Max Bounty (ETH)';
+                    elements.maxBountyLabel.querySelector('span').textContent = 'Max Bounty (ETH)';
                 }
             }
         } catch (e) {
@@ -1016,46 +1141,68 @@ function recalculateBounty() {
         if (state.sellToken.address !== ethers.ZeroAddress) {
             document.getElementById('oracleBounty').textContent = `${totalBountyUsd.toFixed(6)} USDC`;
             elements.maxBountyInput.value = totalBountyUsd.toFixed(6);
-            elements.maxBountyLabel.textContent = 'Max Bounty (USDC)';
+            elements.maxBountyLabel.querySelector('span').textContent = 'Max Bounty (USDC)';
         } else {
             const totalBountyEth = totalBountyUsd / state.currentPrice;
             document.getElementById('oracleBounty').textContent = `${totalBountyEth.toFixed(9)} ETH`;
             elements.maxBountyInput.value = totalBountyEth.toFixed(9);
-            elements.maxBountyLabel.textContent = 'Max Bounty (ETH)';
+            elements.maxBountyLabel.querySelector('span').textContent = 'Max Bounty (ETH)';
         }
     } catch (e) {
         // Silently fail
     }
 }
 
+// Balance update sequence counter to prevent race conditions
+let balanceUpdateSeq = 0;
+
 /**
  * Update token balances
+ * @param {string} blockTag - Optional block tag: "latest", "pending", or block number
  */
-async function updateBalances() {
+async function updateBalances(blockTag = 'latest') {
     if (!wallet.isConnected()) {
         elements.sellBalance.textContent = '0.00';
         elements.buyBalance.textContent = '0.00';
         return;
     }
 
+    // Capture sequence and token addresses at start of this call
+    const mySeq = ++balanceUpdateSeq;
+    const sellAddr = state.sellToken.address;
+    const buyAddr = state.buyToken.address;
+
     // Fetch both balances in parallel
     const [sellResult, buyResult] = await Promise.allSettled([
-        wallet.getTokenBalance(state.sellToken.address),
-        wallet.getTokenBalance(state.buyToken.address)
+        wallet.getTokenBalance(sellAddr, blockTag),
+        wallet.getTokenBalance(buyAddr, blockTag)
     ]);
+
+    // If a newer call started while we were fetching, discard our results
+    if (mySeq !== balanceUpdateSeq) {
+        console.log(`[Balances] Discarding stale result (seq ${mySeq} < ${balanceUpdateSeq})`);
+        return;
+    }
+
+    // If tokens were swapped while we were fetching, discard results
+    if (sellAddr !== state.sellToken.address || buyAddr !== state.buyToken.address) {
+        console.log(`[Balances] Discarding result - tokens changed mid-fetch`);
+        return;
+    }
 
     const sellBal = sellResult.status === 'fulfilled' ? sellResult.value.toString() : '0';
     const buyBal = buyResult.status === 'fulfilled' ? buyResult.value.toString() : '0';
 
-    console.log(`[Balances] ${state.sellToken.symbol}: ${sellBal} (${formatTokenAmount(sellBal, state.sellToken.decimals)}), ${state.buyToken.symbol}: ${buyBal} (${formatTokenAmount(buyBal, state.buyToken.decimals)})`);
+    // Store raw and formatted balances in state for other functions to use
+    state.sellToken.rawBalance = BigInt(sellBal);
+    state.buyToken.rawBalance = BigInt(buyBal);
+    state.sellToken.balance = formatTokenAmount(sellBal, state.sellToken.decimals);
+    state.buyToken.balance = formatTokenAmount(buyBal, state.buyToken.decimals);
 
-    elements.sellBalance.textContent = sellResult.status === 'fulfilled'
-        ? formatTokenAmount(sellResult.value.toString(), state.sellToken.decimals)
-        : '0.00';
+    console.log(`[Balances] ${state.sellToken.symbol}: ${sellBal} (${state.sellToken.balance}), ${state.buyToken.symbol}: ${buyBal} (${state.buyToken.balance})`);
 
-    elements.buyBalance.textContent = buyResult.status === 'fulfilled'
-        ? formatTokenAmount(buyResult.value.toString(), state.buyToken.decimals)
-        : '0.00';
+    elements.sellBalance.textContent = state.sellToken.balance;
+    elements.buyBalance.textContent = state.buyToken.balance;
 }
 
 /**
@@ -1114,6 +1261,55 @@ function updateSwapButton() {
 
     if (!state.buyAmount || parseFloat(state.buyAmount) === 0) {
         btn.textContent = 'Waiting for price...';
+        btn.disabled = true;
+        return;
+    }
+
+    // Live check: if sellAmt + overhead > balance, show Update button
+    if (state.sellToken?.balance && state.sellAmount) {
+        const sellAmt = parseFloat(state.sellAmount);
+        const balance = parseFloat(state.sellToken.balance);
+        if (!isNaN(sellAmt) && !isNaN(balance) && sellAmt > 0) {
+            // Get bounty: use manual maxBounty input if set, otherwise estimate from initLiq
+            let bountyEst = 0;
+            const maxBountyInput = elements.maxBountyInput.value;
+            if (maxBountyInput && maxBountyInput !== '') {
+                bountyEst = parseFloat(maxBountyInput);
+            } else {
+                const initLiqInput = elements.initialLiquidityInput.value || elements.initialLiquidityInput.placeholder;
+                if (initLiqInput && initLiqInput !== '' && initLiqInput !== 'auto') {
+                    const initLiq = parseFloat(initLiqInput);
+                    bountyEst = initLiq * 0.0015; // 0.15% floor
+                }
+            }
+
+            let totalNeeded;
+            if (state.sellToken.address === ethers.ZeroAddress) {
+                // ETH: also need gasComp + settlerReward
+                const gasCompEth = gasOracle.isReady() ? parseFloat(ethers.formatEther(gasOracle.getMatchCost())) : 0.001;
+                // Use manual settler reward if set, otherwise use oracle
+                const settlerInput = elements.settlerRewardInput.value;
+                const settlerEth = (settlerInput && settlerInput !== '')
+                    ? parseFloat(settlerInput)
+                    : (gasOracle.isReady() ? parseFloat(ethers.formatEther(gasOracle.getSettleCost())) : 0.001);
+                totalNeeded = sellAmt + bountyEst + gasCompEth + settlerEth;
+            } else {
+                totalNeeded = sellAmt + bountyEst;
+            }
+
+            if (totalNeeded > balance) {
+                btn.textContent = 'Update Sell Amount';
+                btn.disabled = false;
+                state.needsSellAmountUpdate = true;
+                return;
+            }
+        }
+    }
+    state.needsSellAmountUpdate = false;
+
+    // Check if fees are too high (Est Total Cost > 0.2%)
+    if (state.estTotalCostPct !== null && state.estTotalCostPct > 0.2) {
+        btn.textContent = 'Fees too high';
         btn.disabled = true;
         return;
     }
@@ -1183,6 +1379,56 @@ async function handleSwap() {
         return;
     }
 
+    // Handle "Update Sell Amount" - recalculate sellAmount to fit balance
+    if (state.needsSellAmountUpdate) {
+        const balance = parseFloat(state.sellToken?.balance);
+
+        if (isNaN(balance) || balance <= 0) {
+            showToast('Insufficient Balance', `No ${state.sellToken.symbol} balance available`, 'error');
+            return;
+        }
+
+        // Get bounty: use maxBountyInput if set, otherwise estimate from initLiq
+        let bountyEst = 0;
+        const maxBountyInput = elements.maxBountyInput.value;
+        if (maxBountyInput && maxBountyInput !== '') {
+            bountyEst = parseFloat(maxBountyInput);
+        } else {
+            const initLiqInput = elements.initialLiquidityInput.value || elements.initialLiquidityInput.placeholder;
+            if (initLiqInput && initLiqInput !== '' && initLiqInput !== 'auto') {
+                bountyEst = parseFloat(initLiqInput) * 0.0015;
+            }
+        }
+
+        let newSellAmt;
+        let symbol;
+
+        if (state.sellToken.address === ethers.ZeroAddress) {
+            const gasCompEth = gasOracle.isReady() ? parseFloat(ethers.formatEther(gasOracle.getMatchCost())) : 0.001;
+            const settlerInput = elements.settlerRewardInput.value;
+            const settlerEth = (settlerInput && settlerInput !== '')
+                ? parseFloat(settlerInput)
+                : (gasOracle.isReady() ? parseFloat(ethers.formatEther(gasOracle.getSettleCost())) : 0.001);
+            newSellAmt = Math.max(0, balance - bountyEst - gasCompEth - settlerEth - 0.0001);
+            symbol = 'ETH';
+        } else {
+            newSellAmt = Math.max(0, balance - bountyEst - 0.001);
+            symbol = 'USDC';
+        }
+
+        if (newSellAmt <= 0) {
+            showToast('Insufficient Balance', `Balance too low to cover swap overhead`, 'error');
+            return;
+        }
+
+        elements.sellAmount.value = newSellAmt.toFixed(6);
+        state.sellAmount = elements.sellAmount.value;
+        autoCalculateBuyAmount();
+        updateSwapButton();
+        showToast('Amount Updated', `Sell amount reduced to ${newSellAmt.toFixed(symbol === 'ETH' ? 6 : 2)} ${symbol}`, 'info');
+        return;
+    }
+
     // Check risk acceptance
     if (!hasAcceptedRisk()) {
         try {
@@ -1193,14 +1439,6 @@ async function handleSwap() {
     }
 
     if (!state.sellAmount || !state.buyAmount) {
-        return;
-    }
-
-    // Check $45 notional limit
-    const sellAmt = parseFloat(state.sellAmount);
-    const notionalUsd = state.sellToken.symbol === 'ETH' ? sellAmt * state.currentPrice : sellAmt;
-    if (notionalUsd > 45) {
-        showToast('Limit Exceeded', 'Maximum swap size is $45', 'error');
         return;
     }
 
@@ -1227,8 +1465,14 @@ async function handleSwap() {
         const expirationSeconds = parseInt(elements.expirationInput.value) || 30;
         const settlementTime = parseInt(elements.settlementTimeInput.value) || CONFIG.defaults.settlementTime;
 
-        // Update gas oracle if needed
-        await gasOracle.update(wallet.provider);
+        // Gas oracle is updated periodically - only update if not ready
+        if (!gasOracle.isReady()) {
+            await gasOracle.update(wallet.provider);
+        }
+
+        // Calculate notional for settler reward calculation
+        const sellAmt = parseFloat(state.sellAmount);
+        const notionalUsd = state.sellToken.symbol === 'ETH' ? sellAmt * state.currentPrice : sellAmt;
 
         // Calculate gas compensation (900k L2 gas + L1 data fee)
         // gasOracle uses its own effective gas price (baseFee + 15% tip)
@@ -1345,7 +1589,7 @@ async function handleSwap() {
                 blocksPerSecond: 500,
                 disputeDelay: CONFIG.defaults.disputeDelay,
                 swapFee: CONFIG.defaults.swapFee,
-                protocolFee: CONFIG.defaults.protocolFee,
+                protocolFee: elements.delayModeToggle.checked ? 250 : 0,
                 multiplier: 130,
                 timeType: true
             },
@@ -1372,6 +1616,19 @@ async function handleSwap() {
         };
 
         // Preflight checks on swapParams
+        // Max sell amount limits
+        if (swapParams.sellToken === ethers.ZeroAddress) {
+            if (BigInt(swapParams.sellAmount) > ethers.parseEther('0.1')) {
+                showToast('Limit Exceeded', 'Maximum sell amount is 0.1 ETH', 'error');
+                return;
+            }
+        } else {
+            if (BigInt(swapParams.sellAmount) > BigInt(300 * 1e6)) {
+                showToast('Limit Exceeded', 'Maximum sell amount is 300 USDC', 'error');
+                return;
+            }
+        }
+
         if (BigInt(swapParams.slippageParams.priceTolerated) === BigInt(0)) {
             showToast('Invalid Parameters', 'priceTolerated cannot be zero', 'error');
             return;
@@ -1424,6 +1681,19 @@ async function handleSwap() {
             showToast('Invalid Parameters', 'multiplier cannot exceed 300', 'error');
             return;
         }
+        // initialLiquidity must be >= 9.9% of sellAmount and <= sellAmount
+        const initLiqCheck = BigInt(swapParams.oracleParams.initialLiquidity);
+        const sellAmtCheck = BigInt(swapParams.sellAmount);
+        const minInitLiqCheck = sellAmtCheck * BigInt(99) / BigInt(1000); // 9.9%
+        if (initLiqCheck < minInitLiqCheck) {
+            const pct = (Number(initLiqCheck) / Number(sellAmtCheck) * 100).toFixed(2);
+            showToast('Invalid Parameters', `Initial liquidity (${pct}%) must be at least 9.9% of sell amount`, 'error');
+            return;
+        }
+        if (initLiqCheck > sellAmtCheck) {
+            showToast('Invalid Parameters', 'Initial liquidity cannot exceed sell amount', 'error');
+            return;
+        }
         if (swapParams.fulfillFeeParams.maxFee > 20000) {
             showToast('Invalid Parameters', 'Fulfillment fee cannot exceed 0.2%', 'error');
             return;
@@ -1456,6 +1726,47 @@ async function handleSwap() {
             }
         }
 
+        // Check sellAmount + overhead doesn't exceed balance (use cached balance)
+        const sellAmtBig = BigInt(swapParams.sellAmount);
+        const balanceNum = parseFloat(state.sellToken.balance);
+        if (state.sellToken.address === ethers.ZeroAddress) {
+            // ETH: need sellAmt + bounty + gasComp + settlerReward
+            const rawBalance = ethers.parseEther(balanceNum.toFixed(18));
+            const gasCompWei = ethers.parseEther(swapParams.gasCompensation.toFixed(18));
+            const settlerWei = BigInt(swapParams.oracleParams.settlerReward);
+            const totalNeeded = sellAmtBig + bountyAmt + gasCompWei + settlerWei;
+            if (totalNeeded > rawBalance) {
+                const shortfall = parseFloat(ethers.formatEther(totalNeeded - rawBalance));
+                showToast('Insufficient Balance', `Need ${shortfall.toFixed(6)} more ETH for swap + overhead`, 'error');
+                return;
+            }
+        } else {
+            // USDC: need sellAmt + bounty (if bounty is USDC)
+            if (bountyTokenAddr === CONFIG.tokens.USDC) {
+                const rawBalance = BigInt(Math.floor(balanceNum * 1e6));
+                const totalNeeded = sellAmtBig + bountyAmt;
+                if (totalNeeded > rawBalance) {
+                    const shortfall = Number(totalNeeded - rawBalance) / 1e6;
+                    showToast('Insufficient Balance', `Need ${shortfall.toFixed(4)} more USDC for swap + bounty`, 'error');
+                    return;
+                }
+            }
+        }
+
+        // When selling USDC, still need ETH for settlerReward + gasCompensation
+        if (state.sellToken.address !== ethers.ZeroAddress) {
+            const ethBalanceNum = parseFloat(state.buyToken.balance);
+            const ethBalanceWei = ethers.parseEther(ethBalanceNum.toFixed(18));
+            const gasCompWei = ethers.parseEther(swapParams.gasCompensation.toFixed(18));
+            const settlerWei = BigInt(swapParams.oracleParams.settlerReward);
+            const ethNeeded = gasCompWei + settlerWei;
+            if (ethNeeded > ethBalanceWei) {
+                const shortfall = parseFloat(ethers.formatEther(ethNeeded - ethBalanceWei));
+                showToast('Insufficient ETH', `Need ${shortfall.toFixed(6)} more ETH for settler reward + gas compensation`, 'error');
+                return;
+            }
+        }
+
         console.log('Creating swap with params:', swapParams);
 
         const result = await openSwap.createSwap(swapParams);
@@ -1472,6 +1783,7 @@ async function handleSwap() {
                 buyToken: state.buyToken.symbol,
                 minReceived: minOutFormatted,
                 gasCompensation: swapParams.gasCompensation,
+                settlerReward: swapParams.oracleParams.settlerReward,
                 bountyParams: {
                     ...swapParams.bountyParams,
                     ethPrice: state.currentPrice
@@ -1492,9 +1804,11 @@ async function handleSwap() {
         state.buyAmount = '';
         elements.sellAmount.value = '';
         elements.buyAmount.value = '';
+        elements.initialLiquidityInput.value = ''; // Reset to auto-calculate
+        elements.settlerRewardInput.value = ''; // Reset to auto-calculate
         elements.swapDetails.classList.remove('visible');
         updateSwapButton();
-        updateBalances();
+        updateBalances('pending');
 
     } catch (error) {
         console.error('Swap error:', error);
@@ -1589,6 +1903,7 @@ function updateGasDebug() {
  */
 async function updateCostBreakdown() {
     if (!state.sellAmount || !state.currentPrice) {
+        state.estTotalCostPct = null;
         elements.estTotalCost.textContent = '-';
         elements.costFulfillmentFee.textContent = '-';
         elements.costReporterReward.textContent = '-';
@@ -1617,6 +1932,9 @@ async function updateCostBreakdown() {
             const volBasedFeePct = 0.25 * volSettlement * 100; // 25% of vol as percentage
             fulfillmentFeePct = Math.max(minFeePct, Math.min(maxFeePct, volBasedFeePct));
         }
+        // Apply 1 round of growth (1.2x) to estimate fee at match time, capped at maxFee
+        const growthMultiplier = CONFIG.defaults.growthRate / 10000; // 12000 -> 1.2x
+        fulfillmentFeePct = Math.min(fulfillmentFeePct * growthMultiplier, maxFeePct);
 
         // 2. Initial reporter reward: ~80% of vol * (initial liquidity ratio)
         // Get initial liquidity ratio from input value or placeholder
@@ -1664,19 +1982,26 @@ async function updateCostBreakdown() {
         // gasCompensation from gas oracle
         const gasCompWei = gasOracle.getMatchCost();
         const gasCompEth = parseFloat(ethers.formatEther(gasCompWei));
+        // settlerReward from gas oracle
+        const settlerRewardWei = gasOracle.getSettleCost();
+        const settlerRewardEth = parseFloat(ethers.formatEther(settlerRewardWei));
         // Total gas cost
-        const totalGasEth = swapCreationCostEth + gasCompEth;
+        const totalGasEth = swapCreationCostEth + gasCompEth + settlerRewardEth;
         const gasCostUsd = totalGasEth * state.currentPrice;
         const otherGasPct = (gasCostUsd / swapNotionalUsd) * 100;
 
         // Total
         const totalPct = fulfillmentFeePct + reporterRewardPct + otherGasPct;
+        state.estTotalCostPct = totalPct;
 
         // Update UI
         elements.estTotalCost.textContent = `~${totalPct.toFixed(3)}%`;
         elements.costFulfillmentFee.textContent = `${fulfillmentFeePct.toFixed(3)}%`;
         elements.costReporterReward.textContent = `${reporterRewardPct.toFixed(3)}%`;
         elements.costOtherGas.textContent = `${otherGasPct.toFixed(3)}%`;
+
+        // Update swap button now that cost is calculated
+        updateSwapButton();
 
     } catch (e) {
         console.error('Error updating cost breakdown:', e);
@@ -2007,8 +2332,8 @@ async function handleCancel(swapId, btn) {
         showToast('Order Cancelled', `Order #${swapId} has been cancelled`, 'success');
         loadUserOrders();
         // Refresh balances
-        updateBalances();
-        setTimeout(() => updateBalances(), 1000);
+        updateBalances('pending');
+        setTimeout(() => updateBalances('pending'), 1000);
         // Hide status tracker if this was the tracked swap
         if (statusTracker.swapId === swapId) {
             statusTracker.hide();
@@ -2048,8 +2373,8 @@ async function handleSettle(reportId, btn) {
         await openSwap.settleReport(reportId);
         showToast('Settlement Success', 'Report settled, swap executed!', 'success');
         loadUserOrders();
-        updateBalances();
-        setTimeout(() => updateBalances(), 2000);
+        updateBalances('pending');
+        setTimeout(() => updateBalances('pending'), 2000);
     } catch (error) {
         console.error('Settle error:', error);
         showToast('Settlement Failed', error.message || 'Transaction failed', 'error');

@@ -135,18 +135,58 @@ class WalletManager {
     }
 
     /**
-     * Get token balance
+     * Get token balance via direct RPC call (bypasses MetaMask caching)
+     * @param {string} tokenAddress - Token contract address (zero address for ETH)
+     * @param {string} blockTag - Optional block tag: "latest", "pending", or block number
      */
-    async getTokenBalance(tokenAddress) {
-        if (!this.provider || !this.address) return BigInt(0);
+    async getTokenBalance(tokenAddress, blockTag = 'latest') {
+        if (!this.address) return BigInt(0);
 
-        // Native ETH
-        if (tokenAddress === '0x0000000000000000000000000000000000000000') {
-            return await this.getBalance();
+        try {
+            // Use direct RPC call to bypass MetaMask caching
+            if (tokenAddress === '0x0000000000000000000000000000000000000000') {
+                // Native ETH balance
+                const result = await this.rpcCall('eth_getBalance', [this.address, blockTag]);
+                return BigInt(result);
+            } else {
+                // ERC20 balanceOf call
+                // balanceOf(address) selector = 0x70a08231
+                const data = '0x70a08231' + this.address.slice(2).padStart(64, '0');
+                const result = await this.rpcCall('eth_call', [
+                    { to: tokenAddress, data },
+                    blockTag
+                ]);
+                return BigInt(result);
+            }
+        } catch (e) {
+            console.error('[Wallet] Direct RPC balance fetch failed, falling back to provider:', e);
+            // Fallback to provider
+            if (!this.provider) return BigInt(0);
+            if (tokenAddress === '0x0000000000000000000000000000000000000000') {
+                return await this.provider.getBalance(this.address, blockTag);
+            }
+            const contract = new ethers.Contract(tokenAddress, ERC20_ABI, this.provider);
+            return await contract.balanceOf(this.address, { blockTag });
         }
+    }
 
-        const contract = new ethers.Contract(tokenAddress, ERC20_ABI, this.provider);
-        return await contract.balanceOf(this.address);
+    /**
+     * Direct RPC call to configured network
+     */
+    async rpcCall(method, params = []) {
+        const response = await fetch(CONFIG.rpcUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                jsonrpc: '2.0',
+                method,
+                params,
+                id: Date.now()
+            })
+        });
+        const data = await response.json();
+        if (data.error) throw new Error(data.error.message);
+        return data.result;
     }
 
     /**
