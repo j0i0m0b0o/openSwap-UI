@@ -1974,24 +1974,13 @@ async function updateCostBreakdown() {
 
         // 3. Other gas: swap creation gas + gasCompensation + settlerReward
         if (!gasOracle.isReady()) return;
-        // Swap creation: ~550k gas using MetaMask's suggested gas price
-        let swapCreationCostEth = 0;
-        try {
-            const provider = wallet.provider;
-            if (provider) {
-                // Use getGasPrice() directly - Optimism doesn't support EIP-1559 priority fees
-                const gasPrice = await provider.getGasPrice();
-                const swapCreationGas = BigInt(550000);
-                const swapCreationCostWei = swapCreationGas * gasPrice;
-                swapCreationCostEth = parseFloat(ethers.formatEther(swapCreationCostWei));
-            }
-        } catch (e) {
-            // Fallback to gas oracle if MetaMask unavailable
-            const effectiveGasPrice = gasOracle.getEffectiveGasPrice();
-            const swapCreationGas = BigInt(550000);
-            const swapCreationCostWei = swapCreationGas * effectiveGasPrice;
-            swapCreationCostEth = parseFloat(ethers.formatEther(swapCreationCostWei));
-        }
+        // Swap creation: ~550k gas using baseFee from gasOracle + typical tip
+        const baseFee = gasOracle.baseFee || BigInt(0);
+        const tip = BigInt(100000); // 0.0001 gwei typical tip on Optimism
+        const effectiveGasPrice = baseFee + tip;
+        const swapCreationGas = BigInt(550000);
+        const swapCreationCostWei = swapCreationGas * effectiveGasPrice;
+        const swapCreationCostEth = parseFloat(ethers.formatEther(swapCreationCostWei));
         // gasCompensation from gas oracle
         const gasCompWei = gasOracle.getMatchCost();
         const gasCompEth = parseFloat(ethers.formatEther(gasCompWei));
