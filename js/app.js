@@ -1936,7 +1936,7 @@ async function updateCostBreakdown() {
         const growthMultiplier = CONFIG.defaults.growthRate / 10000; // 12000 -> 1.2x
         fulfillmentFeePct = Math.min(fulfillmentFeePct * growthMultiplier, maxFeePct);
 
-        // 2. Initial reporter reward: ~80% of vol * (initial liquidity ratio)
+        // 2. Initial reporter reward: bountyStartAmt = 0.5 * vol * initLiq (same vol as fulfillment fee)
         // Get initial liquidity ratio from input value or placeholder
         let initLiqRatio = 0.10; // default
         const initLiqInput = elements.initialLiquidityInput.value || elements.initialLiquidityInput.placeholder;
@@ -1947,17 +1947,21 @@ async function updateCostBreakdown() {
             }
         }
 
-        // Volatility from tracker (use IQR if available, otherwise candle vol scaled to settlement time)
+        // Use same Kraken volatility as fulfillment fee for consistency
         const settlementTime = parseInt(elements.settlementTimeInput.value) || CONFIG.defaults.settlementTime;
-        let vol;
-        if (volatility.lastIQR !== null) {
-            vol = volatility.lastIQR;
+        let volSettlement;
+        if (volatility.lastKrakenVol !== null) {
+            volSettlement = volatility.lastKrakenVol / 6.5;
         } else if (volatility.lastCandleVol !== null) {
-            vol = volatility.lastCandleVol / Math.sqrt(60 / settlementTime); // 1-min to settlement time
+            volSettlement = (volatility.lastCandleVol / 1.5) / Math.sqrt(60 / settlementTime);
         } else {
             return;
         }
-        const reporterRewardPct = 0.8 * vol * initLiqRatio * 100; // as percentage
+        // bountyStartAmt = 0.5 * vol * initLiq, with min/max caps
+        const minBountyStartPct = 0.0065 * initLiqRatio; // 0.0065% of initLiq
+        const maxBountyStartPct = 0.2 * initLiqRatio; // 0.2% of initLiq
+        let reporterRewardPct = 0.5 * volSettlement * initLiqRatio * 100;
+        reporterRewardPct = Math.max(minBountyStartPct, Math.min(maxBountyStartPct, reporterRewardPct));
 
         // 3. Other gas: swap creation gas + gasCompensation
         if (!gasOracle.isReady()) return;
