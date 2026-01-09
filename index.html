@@ -459,6 +459,35 @@
             font-size: 13px;
             color: var(--text-muted);
             margin-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .amount-buttons {
+            display: flex;
+            gap: 6px;
+        }
+
+        .amount-btn {
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.15) 0%, rgba(255, 255, 255, 0.08) 100%);
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            border-radius: 4px;
+            color: rgba(255, 255, 255, 0.85);
+            font-size: 11px;
+            font-weight: 600;
+            padding: 3px 8px;
+            cursor: pointer;
+            transition: all 0.15s ease;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+        }
+
+        .amount-btn:hover {
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.22) 0%, rgba(255, 255, 255, 0.12) 100%);
+            border-color: rgba(255, 255, 255, 0.3);
+            color: #fff;
         }
 
         .token-amount-input {
@@ -629,7 +658,6 @@
         .info-tooltip {
             width: 14px;
             height: 14px;
-            opacity: 0.5;
             cursor: help;
         }
 
@@ -1495,6 +1523,7 @@
             max-height: 0;
             overflow: hidden;
             transition: max-height 0.3s ease;
+            margin-top: 8px;
         }
 
         .advanced-panel.open {
@@ -1504,8 +1533,7 @@
         .advanced-content {
             padding: 16px;
             background: var(--bg-input);
-            border-radius: 0 0 var(--radius-md) var(--radius-md);
-            margin-top: -8px;
+            border-radius: var(--radius-md);
         }
 
         .param-row {
@@ -1523,12 +1551,54 @@
         }
 
         .param-input-group label {
-            display: block;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
             font-size: 11px;
             color: var(--text-muted);
             margin-bottom: 4px;
             text-transform: uppercase;
             letter-spacing: 0.5px;
+        }
+
+        .param-input-group .info-tooltip {
+            margin-left: 4px;
+        }
+
+        .param-input-group .info-icon {
+            width: 14px;
+            height: 14px;
+            min-width: 14px;
+            min-height: 14px;
+            font-size: 10px;
+        }
+
+        .param-input-group .info-tooltip .tooltip-text {
+            bottom: auto;
+            top: 100%;
+            margin-bottom: 0;
+            margin-top: 8px;
+            text-transform: none;
+        }
+
+        .param-input-group .info-tooltip .tooltip-text::after {
+            top: auto;
+            bottom: 100%;
+            border-top-color: transparent;
+            border-bottom-color: #000000;
+        }
+
+        /* Right column tooltips - align to right edge */
+        .param-row .param-input-group:last-child .info-tooltip .tooltip-text {
+            left: auto;
+            right: 0;
+            transform: none;
+        }
+
+        .param-row .param-input-group:last-child .info-tooltip .tooltip-text::after {
+            left: auto;
+            right: 10px;
+            transform: none;
         }
 
         .param-input-group input {
@@ -1539,6 +1609,80 @@
             font-family: var(--font-mono);
             font-size: 14px;
             color: var(--text-primary);
+        }
+
+        /* Advanced Settings Divider */
+        .advanced-divider {
+            height: 1px;
+            background: var(--border-color);
+            margin: 16px 0;
+        }
+
+        /* Delay Mode Row */
+        .delay-mode-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-sm);
+        }
+
+        .delay-mode-label {
+            display: flex;
+            align-items: center;
+            font-size: 14px;
+            color: var(--text-secondary);
+        }
+
+        /* Toggle Switch */
+        .toggle-switch {
+            position: relative;
+            display: inline-block;
+            width: 44px;
+            height: 24px;
+        }
+
+        .toggle-switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .toggle-slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: var(--bg-tertiary);
+            border: 1px solid var(--border-color);
+            border-radius: 24px;
+            transition: all 0.2s ease;
+        }
+
+        .toggle-slider:before {
+            position: absolute;
+            content: "";
+            height: 18px;
+            width: 18px;
+            left: 2px;
+            bottom: 2px;
+            background: var(--text-muted);
+            border-radius: 50%;
+            transition: all 0.2s ease;
+        }
+
+        .toggle-switch input:checked + .toggle-slider {
+            background: var(--accent-primary);
+            border-color: var(--accent-primary);
+        }
+
+        .toggle-switch input:checked + .toggle-slider:before {
+            transform: translateX(20px);
+            background: white;
         }
 
         /* Gas Debug Section (hidden) */
@@ -2064,7 +2208,9 @@
             bottom: 100%;
             left: 50%;
             transform: translateX(-50%);
-            background: #1a1a24;
+            background-color: rgb(0, 0, 0) !important;
+            -webkit-backdrop-filter: none !important;
+            backdrop-filter: none !important;
             color: #fff;
             padding: 10px 14px;
             border-radius: 8px;
@@ -2072,16 +2218,15 @@
             line-height: 1.5;
             width: 240px;
             text-align: left;
-            z-index: 1000;
+            z-index: 10000;
             margin-bottom: 8px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
-            transition: opacity 0.2s ease, visibility 0.2s ease;
+            border: 1px solid #444;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 1);
         }
 
         .info-tooltip:hover .tooltip-text {
             visibility: visible;
-            opacity: 1;
+            opacity: 1 !important;
         }
 
         .info-tooltip .tooltip-text::after {
@@ -2091,7 +2236,7 @@
             left: 50%;
             transform: translateX(-50%);
             border: 6px solid transparent;
-            border-top-color: #1a1a24;
+            border-top-color: #000000;
         }
     </style>
 </head>
@@ -2161,7 +2306,13 @@
 
                     <!-- Sell Token -->
                     <div class="token-input-container" id="sellTokenContainer">
-                        <div class="token-input-label">You sell</div>
+                        <div class="token-input-label">
+                            <span>You sell</span>
+                            <div class="amount-buttons">
+                                <button class="amount-btn" id="halfBtn">HALF</button>
+                                <button class="amount-btn" id="maxBtn">MAX</button>
+                            </div>
+                        </div>
                         <div class="token-input-row">
                             <input type="text" class="token-amount-input" id="sellAmount" placeholder="0" inputmode="decimal">
                             <button class="token-selector" id="sellTokenSelector" data-side="sell">
@@ -2268,34 +2419,87 @@
                         <div class="advanced-content">
                             <div class="param-row">
                                 <div class="param-input-group">
-                                    <label>Expiration (s)</label>
+                                    <label>
+                                        <span>Expiration (s)</span>
+                                        <span class="info-tooltip">
+                                            <span class="info-icon">?</span>
+                                            <span class="tooltip-text">If your swap isn't matched in this amount of seconds, it expires</span>
+                                        </span>
+                                    </label>
                                     <input type="number" id="expirationInput" value="30" min="5">
                                 </div>
                                 <div class="param-input-group">
-                                    <label>Slippage (%)</label>
+                                    <label>
+                                        <span>Slippage (%)</span>
+                                        <span class="info-tooltip">
+                                            <span class="info-icon">?</span>
+                                            <span class="tooltip-text">Swap is refunded if final oracle price is more than this far away from provided price</span>
+                                        </span>
+                                    </label>
                                     <input type="text" id="slippageInput" value="0.2">
                                 </div>
                             </div>
                             <div class="param-row">
                                 <div class="param-input-group">
-                                    <label>Settler Reward (ETH)</label>
+                                    <label>
+                                        <span>Settler Reward (ETH)</span>
+                                        <span class="info-tooltip">
+                                            <span class="info-icon">?</span>
+                                            <span class="tooltip-text">Reward paid to settler in the oracle game. Swap is executed in the settle with the final oracle price</span>
+                                        </span>
+                                    </label>
                                     <input type="text" id="settlerRewardInput" placeholder="auto">
                                 </div>
                                 <div class="param-input-group">
-                                    <label>Settlement Time (s)</label>
+                                    <label>
+                                        <span>Settlement Time (s)</span>
+                                        <span class="info-tooltip">
+                                            <span class="info-icon">?</span>
+                                            <span class="tooltip-text">Per-round oracle game settlement time. If a reported price is not disputed in this amount of time, it can be used to execute the swap</span>
+                                        </span>
+                                    </label>
                                     <input type="number" id="settlementTimeInput" value="4" min="1" max="14400">
                                 </div>
                             </div>
                             <div class="param-row">
                                 <div class="param-input-group">
-                                    <label id="initialLiquidityLabel">Initial Liquidity</label>
+                                    <label id="initialLiquidityLabel">
+                                        <span>Initial Liquidity</span>
+                                        <span class="info-tooltip">
+                                            <span class="info-icon">?</span>
+                                            <span class="tooltip-text">Oracle game initial liquidity. If too low, gas fees can deter oracle game participation. Initial reporter is paid a bounty scaling with the size of initial liquidity</span>
+                                        </span>
+                                    </label>
                                     <input type="text" id="initialLiquidityInput" placeholder="auto">
                                 </div>
                                 <div class="param-input-group">
-                                    <label id="maxBountyLabel">Max Bounty (ETH)</label>
+                                    <label id="maxBountyLabel">
+                                        <span>Max Bounty (ETH)</span>
+                                        <span class="info-tooltip">
+                                            <span class="info-icon">?</span>
+                                            <span class="tooltip-text">Max amount you can pay the oracle initial reporter. The bounty starts low, increases over time and caps out at this number</span>
+                                        </span>
+                                    </label>
                                     <input type="text" id="maxBountyInput" placeholder="auto" readonly style="opacity: 0.7;">
                                 </div>
                             </div>
+
+                            <div class="advanced-divider"></div>
+
+                            <div class="delay-mode-row">
+                                <div class="delay-mode-label">
+                                    <span>Delay Mode</span>
+                                    <span class="info-tooltip">
+                                        <span class="info-icon">?</span>
+                                        <span class="tooltip-text">On means you get paid ~0.0025% of the oracle size for each round of delay. The oracle game grows exponentially each round, so with enough delay, you get compensated enough for the wait. If the oracle game seems to have many disputers, it is recommended to turn this setting on.</span>
+                                    </span>
+                                </div>
+                                <label class="toggle-switch">
+                                    <input type="checkbox" id="delayModeToggle">
+                                    <span class="toggle-slider"></span>
+                                </label>
+                            </div>
+
                             <!-- Gas Debug Section -->
                             <div class="gas-debug-section" id="gasDebugSection">
                                 <div class="gas-debug-header">Gas Breakdown (Debug)</div>
@@ -2541,9 +2745,28 @@
                                         <span class="status-detail-label">Fulfillment Fee</span>
                                         <span class="status-detail-value" id="executedFulfillFee">—</span>
                                     </div>
-                                    <div class="status-detail-row">
-                                        <span class="status-detail-label">Gas Costs</span>
+                                    <div class="status-detail-row gas-breakdown-row" id="gasBreakdownToggle">
+                                        <span class="status-detail-label">
+                                            Gas Costs
+                                            <svg class="cost-dropdown-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width: 12px; height: 12px; margin-left: 4px;">
+                                                <polyline points="6,9 12,15 18,9"></polyline>
+                                            </svg>
+                                        </span>
                                         <span class="status-detail-value" id="executedGasCosts">—</span>
+                                    </div>
+                                    <div class="cost-breakdown-panel gas-breakdown-panel" id="gasBreakdownPanel" style="display: none;">
+                                        <div class="cost-breakdown-item">
+                                            <span class="cost-breakdown-label">Swap Tx Gas</span>
+                                            <span class="cost-breakdown-value" id="executedSwapTxGas">—</span>
+                                        </div>
+                                        <div class="cost-breakdown-item">
+                                            <span class="cost-breakdown-label">Matcher Gas Compensation</span>
+                                            <span class="cost-breakdown-value" id="executedGasComp">—</span>
+                                        </div>
+                                        <div class="cost-breakdown-item">
+                                            <span class="cost-breakdown-label">Oracle Settler Reward</span>
+                                            <span class="cost-breakdown-value" id="executedSettlerReward">—</span>
+                                        </div>
                                     </div>
                                     <div class="status-detail-row" style="border-top: 1px solid var(--border-color); margin-top: 4px; padding-top: 8px;">
                                         <span class="status-detail-label" style="font-weight: 600;">Total Expenses</span>
