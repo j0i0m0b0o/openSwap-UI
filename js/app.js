@@ -1307,6 +1307,15 @@ function updateSwapButton() {
     }
     state.needsSellAmountUpdate = false;
 
+    // Check if swap notional exceeds $45 max (testing limit)
+    const sellAmt = parseFloat(state.sellAmount);
+    const notionalUsd = state.sellToken.symbol === 'ETH' ? sellAmt * state.currentPrice : sellAmt;
+    if (notionalUsd > 45) {
+        btn.textContent = 'Max swap size $45';
+        btn.disabled = true;
+        return;
+    }
+
     // Check if fees are too high (Est Total Cost > 0.2%)
     if (state.estTotalCostPct !== null && state.estTotalCostPct > 0.2) {
         btn.textContent = 'Fees too high';
