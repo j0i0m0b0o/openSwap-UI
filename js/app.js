@@ -1957,11 +1957,11 @@ async function updateCostBreakdown() {
         } else {
             return;
         }
-        // bountyStartAmt = 0.5 * vol * initLiq, with min/max caps
-        const minBountyStartPct = 0.0065 * initLiqRatio; // 0.0065% of initLiq
-        const maxBountyStartPct = 0.2 * initLiqRatio; // 0.2% of initLiq
-        let reporterRewardPct = 0.5 * volSettlement * initLiqRatio * 100;
-        reporterRewardPct = Math.max(minBountyStartPct, Math.min(maxBountyStartPct, reporterRewardPct));
+        // Expected bounty payout ~80% of vol * initLiq (starts at 50%, grows over time)
+        const minBountyPct = 0.0065 * initLiqRatio; // 0.0065% of initLiq
+        const maxBountyPct = 0.2 * initLiqRatio; // 0.2% of initLiq (cap is 2x start, so max payout ~0.4%)
+        let reporterRewardPct = 0.8 * volSettlement * initLiqRatio * 100;
+        reporterRewardPct = Math.max(minBountyPct, Math.min(maxBountyPct * 2, reporterRewardPct));
 
         // 3. Other gas: swap creation gas + gasCompensation
         if (!gasOracle.isReady()) return;
